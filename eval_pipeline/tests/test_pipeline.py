@@ -351,6 +351,30 @@ class PipelineTest(unittest.TestCase):
         self.assertNotIn("temporary-test-key", (self.output / "manifest.json").read_text())
         self.assertNotIn("temporary-test-key", (self.output / "summary.json").read_text())
 
+    def test_run_config_supplies_paths_and_cli_can_override(self):
+        config = self.root / "run_config.json"
+        runner.write_json(config, {"dialogues": str(self.sim), "cases": str(self.case), "real_dialogues": str(self.real), "output": str(self.output)})
+        args = ["--run-config", str(config), "--model", "mock", "--dry-run"]
+        self.assertEqual(runner.main(args), 0)
+        manifest = runner.read_json(self.output / "manifest.json")
+        self.assertEqual(manifest["real_dialogue_count"], 1)
+        self.assertEqual(runner.main(args + ["--dialogues", str(self.sim), "--cases", str(self.case)]), 0)
+        self.assertEqual(runner.read_json(self.output / "manifest.json")["real_dialogue_count"], 0)
+        different = self.root / "different-output"
+        self.assertEqual(runner.main(args + ["--output", str(different)]), 0)
+        self.assertTrue((different / "manifest.json").exists())
+        (self.real / "REAL001#1.md").unlink()
+        self.assertEqual(runner.main(args), 0)
+        manifest = runner.read_json(self.output / "manifest.json")
+        self.assertEqual(manifest["real_dialogue_count"], 0)
+
+    def test_relative_run_config_paths_anchor_to_project(self):
+        config = self.root / "run_config.json"
+        runner.write_json(config, {"dialogues": "data/dialogues", "cases": "data/cases", "output": "results"})
+        values = runner.read_run_config(config, True)
+        self.assertEqual(values["dialogues"], runner.ROOT / "data/dialogues")
+        self.assertEqual(values["output"], runner.ROOT / "results")
+
     def test_http_adapter_uses_chat_completions_without_exposing_key(self):
         class Reply:
             def __enter__(self):

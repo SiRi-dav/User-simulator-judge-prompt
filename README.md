@@ -14,9 +14,17 @@ python3 -m eval_pipeline.runner \
   --dry-run
 ```
 
-去掉 `--dry-run` 后调用评测模型。本项目的接口地址、模型名和密钥已放在 `eval_pipeline/.local_api.json`，程序会自动读取。请仅在获准访问公司接口和处理评测数据的环境中运行。若服务地址或密钥变化，更新该配置或设置 `EVAL_BASE_URL`、`EVAL_MODEL`、`EVAL_API_KEY` 环境变量。
+正式运行时，将模拟对话放在 `data/dialogues/`，案例放在 `data/cases/`，真人对话（如有）放在 `data/real_dialogues/`。这几个目录已加入 `.gitignore`，数据不会随普通 Git 提交上传。程序默认按 `eval_pipeline/run_config.json` 读取它们，结果写入 `results/`；因此无需每次指定路径：
 
-Windows 公司电脑安装 Python 3.10+ 后，可双击 `run_example.bat` 运行示例；正式数据请按下方程序使用说明指定实际目录。
+```bash
+python3 -m eval_pipeline.runner
+```
+
+如果数据放在别处，只需修改一次 `eval_pipeline/run_config.json`。命令行参数也可临时覆盖配置。真人目录为空时会提示并跳过 B3 真人比较。
+
+本项目的接口地址、模型名和密钥已放在 `eval_pipeline/.local_api.json`，程序会自动读取。请仅在获准访问公司接口和处理评测数据的环境中运行。若服务地址或密钥变化，更新该配置或设置 `EVAL_BASE_URL`、`EVAL_MODEL`、`EVAL_API_KEY` 环境变量。
+
+Windows 公司电脑安装 Python 3.10+ 后，可双击 `run_example.bat` 运行示例；放好实际数据后，双击 `run_eval.bat` 做正式评测。
 
 实际数据应分别放在模拟对话与案例目录。真人对话可通过 `--real-dialogues` 加入 B3 对照。完整输入格式、结果说明和风险清单见 [程序使用说明](eval_pipeline/README.md) 与 [实机测试前审查](eval_pipeline/PRE_LIVE_REVIEW.md)。
 

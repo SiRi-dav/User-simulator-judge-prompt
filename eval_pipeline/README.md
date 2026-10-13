@@ -10,7 +10,11 @@
 - 一个兼容 OpenAI `POST /v1/chat/completions` 的评测模型服务。程序不会启动或部署模型。
 - 模型应能返回 prompt 要求的 JSON。模型服务地址、模型名及 API key 由本机配置或运行时环境变量读取，不写进任务结果。
 
-当前机器已设置 `eval_pipeline/.local_api.json`：截图中的服务地址、模型名与密钥均由程序自动读取。该文件权限为仅文件所有者可读写，并已列入 `eval_pipeline/.gitignore`。不要把它复制到公开仓库或结果目录。环境变量和命令行中的模型/地址会覆盖本机配置；`EVAL_API_KEY` 会覆盖本机密钥。换机器时可用 `--api-config /path/to/private-config.json` 指定另一份同格式文件。
+当前项目已按用户授权把公司接口配置放在 `eval_pipeline/.local_api.json`：地址、模型名与密钥均由程序自动读取，并随私有仓库同步。不要把它复制到公开仓库或结果目录。环境变量和命令行中的模型/地址会覆盖本机配置；`EVAL_API_KEY` 会覆盖配置中的密钥。换机器时也可用 `--api-config /path/to/private-config.json` 指定另一份同格式文件。
+
+输入与输出路径可以在 `eval_pipeline/run_config.json` 中设置一次。默认值是仓库根目录下的 `data/dialogues`（模拟对话）、`data/cases`（案例）、`data/real_dialogues`（真人对话）和 `results`（输出）。相对路径以仓库根目录为准，与当前终端所在目录无关。准备好数据后，从仓库根目录直接运行 `python3 -m eval_pipeline.runner`；Windows 可运行 `run_eval.bat`。真人目录不存在或没有受支持文件时，本次自动跳过 B3 真人对比，并显示提示。
+
+命令行的 `--dialogues`、`--cases`、`--real-dialogues`、`--output` 可临时覆盖配置；也可以用 `--run-config` 指定另一份路径配置。输入目录要分开，输出不能放在任一输入目录内。当前仓库已获授权纳入公司 API 配置，克隆时会得到它；请按项目访问权限管理仓库和本地副本。
 
 2026-10-13 在当前机器尝试连接该内网服务，TCP 端口超时；请求未到达模型。请在能访问该内网地址的网络环境下再做短请求验证，然后运行示例评测。此时无法判断密钥、模型名和服务返回格式是否有效。
 

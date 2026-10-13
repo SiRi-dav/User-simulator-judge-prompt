@@ -1,0 +1,6 @@
+{
+  "dialogues": "data/dialogues",
+  "cases": "data/cases",
+  "real_dialogues": "data/real_dialogues",
+  "output": "results"
+}

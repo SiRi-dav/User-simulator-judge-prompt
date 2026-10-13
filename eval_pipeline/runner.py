@@ -80,6 +80,18 @@ def read_api_config(path: Path, explicit: bool = False) -> dict[str, str]:
     return config
 
 
+def read_run_config(path: Path, explicit: bool = False) -> dict[str, Path]:
+    if not path.exists():
+        if explicit:
+            raise ValueError(f"运行路径配置不存在：{path}")
+        return {}
+    config = read_json(path)
+    allowed = {"dialogues", "cases", "real_dialogues", "output"}
+    if not isinstance(config, dict) or any(key not in allowed or not isinstance(value, str) or not value.strip() for key, value in config.items()):
+        raise ValueError("运行路径配置仅支持非空字符串字段 dialogues、cases、real_dialogues、output")
+    return {key: Path(value) if Path(value).is_absolute() else ROOT / value for key, value in config.items()}
+
+
 def list_files(folder: Path) -> list[Path]:
     if not folder.is_dir():
         raise ValueError(f"目录不存在：{folder}")
@@ -878,14 +890,15 @@ def summarize(output: Path, jobs: list[dict[str, Any]], skipped: list[dict[str, 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="用户模拟器评测：读取对话与案例、调用兼容 Chat Completions 的模型、输出结果")
-    parser.add_argument("--dialogues", type=Path, required=True, help="模拟对话目录")
-    parser.add_argument("--cases", type=Path, required=True, help="案例目录")
+    parser.add_argument("--dialogues", type=Path, help="模拟对话目录；默认从运行路径配置读取")
+    parser.add_argument("--cases", type=Path, help="案例目录；默认从运行路径配置读取")
     parser.add_argument("--real-dialogues", type=Path, help="可选真人对话目录，供 B3 对照")
-    parser.add_argument("--output", type=Path, required=True, help="结果目录")
+    parser.add_argument("--output", type=Path, help="结果目录；默认从运行路径配置读取")
     parser.add_argument("--model", default=os.environ.get("EVAL_MODEL", ""), help="评测模型名；也可设 EVAL_MODEL")
     parser.add_argument("--base-url", default=os.environ.get("EVAL_BASE_URL", ""), help="兼容 OpenAI Chat Completions 的 /v1 地址；也可设 EVAL_BASE_URL")
     parser.add_argument("--api-key-env", default="EVAL_API_KEY", help="保存 API key 的环境变量名；本地无认证服务可不设")
     parser.add_argument("--api-config", type=Path, help="本机 API 配置 JSON；默认读取 eval_pipeline/.local_api.json（若存在）")
+    parser.add_argument("--run-config", type=Path, help="输入与输出路径配置 JSON；默认读取 eval_pipeline/run_config.json")
     parser.add_argument("--batch-size", type=int, default=8, help="每个 Batch 任务包含多少段模拟对话")
     parser.add_argument("--annotation-batch-size", type=int, default=4, help="每个标注任务包含多少段对话")
     parser.add_argument("--min-comparison-n", type=int, default=5, help="B3 单个比较条件每组最少的 USER 消息数")
@@ -898,10 +911,23 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         config = read_api_config(args.api_config or Path(__file__).resolve().parent / ".local_api.json", args.api_config is not None)
+        paths = read_run_config(args.run_config or Path(__file__).resolve().parent / "run_config.json", args.run_config is not None)
     except (ValueError, OSError, json.JSONDecodeError) as exc:
-        parser.error(f"API 配置错误：{exc}")
+        parser.error(f"配置错误：{exc}")
     args.model = args.model or config.get("model", "")
     args.base_url = args.base_url or config.get("base_url", "")
+    use_config_real = args.dialogues is None and args.cases is None and args.real_dialogues is None
+    args.dialogues = args.dialogues or paths.get("dialogues")
+    args.cases = args.cases or paths.get("cases")
+    args.output = args.output or paths.get("output")
+    real_from_config = use_config_real and "real_dialogues" in paths
+    if use_config_real:
+        args.real_dialogues = paths.get("real_dialogues")
+    if not args.dialogues or not args.cases or not args.output:
+        parser.error("缺少模拟对话、案例或输出目录；请设置 eval_pipeline/run_config.json 或使用 --dialogues、--cases、--output")
+    if real_from_config and (not args.real_dialogues.is_dir() or not list_files(args.real_dialogues)):
+        print(f"真人对话目录尚无可读取文件，本次不执行 B3 真人对比：{args.real_dialogues}", file=sys.stderr)
+        args.real_dialogues = None
     if not args.model:
         parser.error("缺少 --model 或 EVAL_MODEL")
     if not args.dry_run and not args.base_url:
