@@ -23,12 +23,12 @@ from urllib import error, request
 
 ROOT = Path(__file__).resolve().parent.parent
 PROMPT_PATHS = {
-    "natural_flow_turn": ROOT / "docs/自然流畅评测模块0929/natural_flow_turn.md",
-    "natural_flow_dialogue": ROOT / "docs/自然流畅评测模块0929/natural_flow_dialogue.md",
-    "information_leakage_dialogue": ROOT / "docs/信息泄漏评测模块0930/information_leakage_dialogue.md",
-    "expression_realism_dialogue": ROOT / "docs/真实度评测模块0930/expression_realism_dialogue.md",
-    "expression_feature_annotation": ROOT / "docs/真实度评测模块0930/expression_feature_annotation.md",
-    "expression_realism_batch": ROOT / "docs/真实度评测模块0930/expression_realism_batch.md",
+    "natural_flow_turn": ROOT / "prompts/natural_flow_turn.md",
+    "natural_flow_dialogue": ROOT / "prompts/natural_flow_dialogue.md",
+    "information_leakage_dialogue": ROOT / "prompts/information_leakage_dialogue.md",
+    "expression_realism_dialogue": ROOT / "prompts/expression_realism_dialogue.md",
+    "expression_feature_annotation": ROOT / "prompts/expression_feature_annotation.md",
+    "expression_realism_batch": ROOT / "prompts/expression_realism_batch.md",
 }
 PLACEHOLDERS = {
     "natural_flow_turn": ["{{DIALOGUE_TEXT}}"],
