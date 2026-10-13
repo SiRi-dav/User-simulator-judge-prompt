@@ -241,7 +241,31 @@ def parse_markdown_dialogues(path: Path) -> list[Dialogue]:
     return result
 
 
-def load_dialogues(folder: Path) -> list[Dialogue]:
+def make_real_dialogue(obj: dict[str, Any], source: Path) -> Dialogue:
+    """Read the exported human-service format without treating its numeric key as a case ID."""
+    if "caseID" not in obj:
+        return make_dialogue(obj, source, source.stem if ID_RE.match(source.stem) else None)
+    case_ids = obj["caseID"]
+    if isinstance(case_ids, str):
+        case_ids = [case_ids]
+    if not isinstance(case_ids, list) or len(case_ids) != 1 or not isinstance(case_ids[0], str) or not case_ids[0].strip():
+        raise ValueError(f"真人对话 caseID 应恰有一个非空案例编号：{source}")
+    conversation_keys = [key for key, value in obj.items() if isinstance(key, str) and key.isdigit() and isinstance(value, list)]
+    if len(conversation_keys) != 1:
+        raise ValueError(f"真人对话应恰有一个数字对话编号：{source}")
+    conversation_id = conversation_keys[0]
+    messages = []
+    for index, entry in enumerate(obj[conversation_id], 1):
+        if not isinstance(entry, dict) or len(entry) != 1:
+            raise ValueError(f"真人对话 {conversation_id} 第 {index} 条消息格式不符：{source}")
+        role, content = next(iter(entry.items()))
+        if role not in {"用户", "客服"} or not isinstance(content, str) or not content.strip():
+            raise ValueError(f"真人对话 {conversation_id} 第 {index} 条消息缺少用户/客服文本：{source}")
+        messages.append({"role": "user" if role == "用户" else "assistant", "content": content})
+    return make_dialogue({"dialogue_id": f"REAL_{conversation_id}", "case_id": case_ids[0].strip(), "session_index": 1, "messages": messages}, source)
+
+
+def load_dialogues(folder: Path, real_reference: bool = False) -> list[Dialogue]:
     items = []
     for path in list_files(folder):
         if path.suffix.lower() in {".md", ".txt"}:
@@ -250,7 +274,7 @@ def load_dialogues(folder: Path) -> list[Dialogue]:
             for obj in json_records(path):
                 if not isinstance(obj, dict):
                     raise ValueError(f"对话记录不是对象：{path}")
-                items.append(make_dialogue(obj, path, path.stem if ID_RE.match(path.stem) else None))
+                items.append(make_real_dialogue(obj, path) if real_reference else make_dialogue(obj, path, path.stem if ID_RE.match(path.stem) else None))
     if not items:
         raise ValueError(f"没有找到对话：{folder}")
     seen = set()
@@ -977,7 +1001,7 @@ def main(argv: list[str] | None = None) -> int:
         selection = {"total_dialogues": len(all_dialogues), "start_dialogue": args.start_dialogue, "end_dialogue": end_index, "selected_count": len(dialogues), "limit_dialogues": args.limit_dialogues, "dialogue_ids": [d.dialogue_id for d in dialogues]}
         output = output_root / f"dialogues_{args.start_dialogue:05d}-{end_index:05d}" if args.limit_dialogues is not None or args.start_dialogue != 1 else output_root
         cases = load_cases(args.cases)
-        real = load_dialogues(args.real_dialogues) if args.real_dialogues else []
+        real = load_dialogues(args.real_dialogues, real_reference=True) if args.real_dialogues else []
         if real and set(d.dialogue_id for d in real) & set(d.dialogue_id for d in dialogues):
             # Source sets are distinguished in prompt, but duplicate IDs complicate
             # joining annotation records and audit trails.
