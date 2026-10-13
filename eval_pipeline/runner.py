@@ -129,6 +129,74 @@ def json_records(path: Path) -> list[Any]:
     return obj if isinstance(obj, list) else [obj]
 
 
+def iter_real_records(path: Path):
+    """Stream large top-level JSON arrays or JSONL without loading every dialogue."""
+    with path.open("r", encoding="utf-8-sig") as file:
+        first = file.read(1)
+        while first and first.isspace():
+            first = file.read(1)
+        if first == "[":
+            decoder = json.JSONDecoder()
+            buffer = ""
+            expect_value = True
+            seen = 0
+            while True:
+                buffer = buffer.lstrip()
+                if not buffer:
+                    chunk = file.read(65536)
+                    if not chunk:
+                        raise ValueError(f"真人对话 JSON 数组未闭合：{path}")
+                    buffer += chunk
+                    continue
+                if buffer[0] == "]":
+                    if expect_value and seen:
+                        raise ValueError(f"真人对话 JSON 数组末尾多余逗号：{path}")
+                    if (buffer[1:] + file.read()).strip():
+                        raise ValueError(f"真人对话 JSON 数组后有多余内容：{path}")
+                    return
+                if not expect_value:
+                    if buffer[0] != ",":
+                        raise ValueError(f"真人对话 JSON 数组记录之间缺少逗号：{path}")
+                    buffer, expect_value = buffer[1:], True
+                    continue
+                if buffer[0] == ",":
+                    raise ValueError(f"真人对话 JSON 数组中存在多余逗号：{path}")
+                try:
+                    record, end = decoder.raw_decode(buffer)
+                except json.JSONDecodeError as exc:
+                    chunk = file.read(65536)
+                    if not chunk:
+                        raise ValueError(f"真人对话 JSON 无法解析：{path}: {exc}") from exc
+                    buffer += chunk
+                    continue
+                yield record
+                buffer = buffer[end:]
+                expect_value = False
+                seen += 1
+        elif first:
+            if path.suffix.lower() == ".jsonl":
+                yield json.loads(first + file.readline())
+                for line in file:
+                    if line.strip():
+                        yield json.loads(line)
+            else:
+                yield json.loads(first + file.read())
+
+
+def real_record_case_id(obj: dict[str, Any]) -> str:
+    if "caseID" in obj:
+        values = obj["caseID"]
+        if isinstance(values, str):
+            values = [values]
+        return values[0].strip() if isinstance(values, list) and len(values) == 1 and isinstance(values[0], str) else ""
+    case_id = obj.get("case_id")
+    if isinstance(case_id, str) and case_id.strip():
+        return case_id.strip()
+    identifier = str(obj.get("dialogue_id") or obj.get("session_id") or "")
+    match = ID_RE.match(identifier)
+    return match.group(1) if match else ""
+
+
 @dataclass(frozen=True)
 class Dialogue:
     dialogue_id: str
@@ -283,6 +351,35 @@ def load_dialogues(folder: Path, real_reference: bool = False) -> list[Dialogue]
             raise ValueError(f"重复 dialogue_id：{d.dialogue_id}")
         seen.add(d.dialogue_id)
     return items
+
+
+def load_matching_real_dialogues(source: Path, case_ids: set[str]) -> tuple[list[Dialogue], dict[str, int]]:
+    """Select exact-case human references before annotation or batch requests."""
+    selected = []
+    audit = {"scanned": 0, "missing_case_id": 0, "matched": 0}
+    for path in list_files(source):
+        if path.suffix.lower() in {".md", ".txt"}:
+            records = parse_markdown_dialogues(path)
+            audit["scanned"] += len(records)
+            selected.extend(d for d in records if d.case_id in case_ids)
+            continue
+        for obj in iter_real_records(path):
+            audit["scanned"] += 1
+            if not isinstance(obj, dict):
+                raise ValueError(f"真人对话记录不是对象：{path}")
+            case_id = real_record_case_id(obj)
+            if not case_id:
+                audit["missing_case_id"] += 1
+                continue
+            if case_id in case_ids:
+                selected.append(make_real_dialogue(obj, path))
+    seen = set()
+    for dialogue in selected:
+        if dialogue.dialogue_id in seen:
+            raise ValueError(f"匹配到重复真人对话编号：{dialogue.dialogue_id}")
+        seen.add(dialogue.dialogue_id)
+    audit["matched"] = len(selected)
+    return selected, audit
 
 
 def normalize_case(obj: dict[str, Any], source: Path, fallback_id: str | None = None) -> tuple[str, dict[str, Any]]:
@@ -756,15 +853,12 @@ def wasserstein_1(left: list[int], right: list[int]) -> float:
     return round(distance, 4)
 
 
-def scenario_key(dialogue: Dialogue) -> str:
-    """An explicit shared scenario ID takes precedence over an exact case ID."""
-    return str(dialogue.metadata.get("scenario_id") or dialogue.case_id).strip()
-
-
 def feature_statistics(batch: list[dict[str, Any]], real: list[dict[str, Any]], min_n: int, comparability_note: str, scenario_by_id: dict[str, str] | None = None) -> list[dict[str, Any]]:
     batch_ids = {d["dialogue_id"] for d in batch}
     real_ids = {d["dialogue_id"] for d in real}
     shared_scenarios = ({scenario_by_id[k] for k in batch_ids if k in scenario_by_id} & {scenario_by_id[k] for k in real_ids if k in scenario_by_id}) if scenario_by_id else set()
+    if not shared_scenarios:
+        return []
     matched = bool(shared_scenarios)
     scenario_filter = {k: v for k, v in scenario_by_id.items() if v in shared_scenarios} if matched and scenario_by_id else None
     bg = comparable_rows(annotation_index(batch), scenario_filter)
@@ -791,12 +885,12 @@ def feature_statistics(batch: list[dict[str, Any]], real: list[dict[str, Any]], 
             is_single = field in {"formality", "organization"}
             metric = "total_variation" if is_single else "mean_absolute_prevalence_gap"
             value = (sum(abs(raw_gaps[label]) for label in labels) / 2 if is_single else sum(abs(raw_gaps[label]) for label in labels) / len(labels))
-            note = comparability_note + ("；未按相同案例或任务情境配对，仅按交流条件分层" if not matched else "；按相同 case_id/scenario_id 配对")
+            note = comparability_note + "；按相同 case_id 配对"
             out.append({"stat_id": f"B3_{len(out)+1:04d}", "criterion": "B3", "condition": condition, "matching_level": "same_scenario" if matched else "context_only", "feature": field, "definition": "每条USER消息可观察标签的出现比例；多选类别各自计入，分母是该特征可判的消息数", "unit": "比例分布", "sample_unit": "USER消息", "batch_n": bn, "batch_dialogue_n": len({m['_dialogue_id'] for m, _ in b_valid}), "batch_value": bv, "reference_n": rn, "reference_dialogue_n": len({m['_dialogue_id'] for m, _ in r_valid}), "reference_value": rv, "category_gaps": gaps, "distance": {"metric": metric, "value": round(value, 4), "unit": "0-1", "direction": "越小越接近；仅为本条件下的分布差异"}, "method": "两组使用同一标注prompt；按表达任务和助手要求分层，排除直接引用；程序计数并计算分布距离", "comparability_notes": note})
         lengths_left = [len(m["user_text"].strip()) for m in left]
         lengths_right = [len(m["user_text"].strip()) for m in right]
         if min(len(lengths_left), len(lengths_right)) >= min_n:
-            note = comparability_note + ("；未按相同案例或任务情境配对，仅按交流条件分层" if not matched else "；按相同 case_id/scenario_id 配对")
+            note = comparability_note + "；按相同 case_id 配对"
             out.append({"stat_id": f"B3_{len(out)+1:04d}", "criterion": "B3", "condition": condition, "matching_level": "same_scenario" if matched else "context_only", "feature": "reply_length", "definition": "USER消息原文去首尾空白后的Unicode字符数，包含标点，不含Markdown角色标签；直接引用消息已排除", "unit": "字符", "sample_unit": "USER消息", "batch_n": len(left), "batch_dialogue_n": len({m['_dialogue_id'] for m in left}), "batch_value": {"median": median(lengths_left)}, "reference_n": len(right), "reference_dialogue_n": len({m['_dialogue_id'] for m in right}), "reference_value": {"median": median(lengths_right)}, "distance": {"metric": "wasserstein_1", "value": wasserstein_1(lengths_left, lengths_right), "unit": "字符", "direction": "越小越接近；仅为本条件下的长度分布差异"}, "method": "程序按相同规则计算两组中位数及逐条长度的经验Wasserstein-1距离", "comparability_notes": note})
     for stat in out:
         field = stat["feature"]
@@ -816,7 +910,7 @@ def comparison_coverage(batch: list[dict[str, Any]], real: list[dict[str, Any]],
         total = {(d["dialogue_id"], m["message_id"]) for d in rows for m in d["messages"]}
         eligible_groups = comparable_rows(annotation_index(rows))
         eligible = {(m["_dialogue_id"], m["message_id"]) for group in eligible_groups.values() for m in group}
-        matched = {key for key in eligible if not shared or scenarios[key[0]] in shared}
+        matched = {key for key in eligible if shared and scenarios[key[0]] in shared}
         used = {(m["dialogue_id"], m["message_id"]) for stat in stats for m in stat[name + "_messages"]}
         report["groups"][name] = {
             "input_dialogue_n": len(rows), "input_user_message_n": len(total),
@@ -879,13 +973,13 @@ def make_batch_jobs(dialogues: list[Dialogue], real: list[Dialogue], model: str,
     # external statistics are computed from the full real reference set.
     for i, group in enumerate(group_chunks(dialogues, batch_size), 1):
         batch_id = f"batch_{i:03d}"
-        scenarios = {scenario_key(d) for d in group}
-        matched_real = [d for d in real if scenario_key(d) in scenarios]
-        reference_sample = (matched_real or real)[:batch_size]
+        case_ids = {d.case_id for d in group}
+        matched_real = [d for d in real if d.case_id in case_ids]
+        reference_sample = matched_real[:batch_size]
         real_text = "\n".join(render_dialogue(d, include_outcome=False) for d in reference_sample)
-        setup = comparison_setup + ("；展示的真人原文只是参照样例，外部统计使用完整真人集合" if real else "")
+        setup = comparison_setup + ("；展示的真人原文只是同案例参照样例，外部统计使用全部同案例真人对话" if matched_real else "；本批没有同 case_id 真人对话")
         parts = ["# 评测补充信息", f"- batch_id: {batch_id}", f"- comparison_setup: {setup}", f"- target_population: {target_population}", "", "# 待评价对话", "", "\n".join(render_dialogue(d, include_outcome=False) for d in group)]
-        if real:
+        if matched_real:
             parts += ["", "# 真实参照对话", "", real_text]
             if sim_labels is not None and real_labels is not None:
                 labels = {
@@ -902,7 +996,7 @@ def make_batch_jobs(dialogues: list[Dialogue], real: list[Dialogue], model: str,
                 parts += ["", "# 外部统计", "", json.dumps(prompt_stats, ensure_ascii=False)]
         batch_job = job("expression_realism_batch", batch_id, {"{{INPUT_MARKDOWN}}": "\n".join(parts)}, model)
         batch_job["b3_stat_ids"] = [stat["stat_id"] for stat in stats_by_batch.get(batch_id, [])]
-        batch_job["has_real_reference"] = bool(real)
+        batch_job["has_real_reference"] = bool(matched_real)
         batch_job["batch_dialogue_count"] = len(group)
         batch_job["has_target_population"] = target_population.strip().lower() not in {"", "未提供", "未知", "unknown"}
         jobs.append(batch_job)
@@ -1001,7 +1095,12 @@ def main(argv: list[str] | None = None) -> int:
         selection = {"total_dialogues": len(all_dialogues), "start_dialogue": args.start_dialogue, "end_dialogue": end_index, "selected_count": len(dialogues), "limit_dialogues": args.limit_dialogues, "dialogue_ids": [d.dialogue_id for d in dialogues]}
         output = output_root / f"dialogues_{args.start_dialogue:05d}-{end_index:05d}" if args.limit_dialogues is not None or args.start_dialogue != 1 else output_root
         cases = load_cases(args.cases)
-        real = load_dialogues(args.real_dialogues, real_reference=True) if args.real_dialogues else []
+        wanted_cases = {d.case_id for d in dialogues}
+        real, real_audit = load_matching_real_dialogues(args.real_dialogues, wanted_cases) if args.real_dialogues else ([], {"scanned": 0, "missing_case_id": 0, "matched": 0})
+        if args.real_dialogues:
+            print(f"真人对话已扫描 {real_audit['scanned']} 条；同 case_id 匹配 {real_audit['matched']} 条；缺少单一 caseID {real_audit['missing_case_id']} 条。", flush=True)
+        if args.real_dialogues and not real:
+            print("真人对话中没有与本批模拟对话相同的 case_id；本次不执行 B3 真人比较。", file=sys.stderr)
         if real and set(d.dialogue_id for d in real) & set(d.dialogue_id for d in dialogues):
             # Source sets are distinguished in prompt, but duplicate IDs complicate
             # joining annotation records and audit trails.
@@ -1012,7 +1111,7 @@ def main(argv: list[str] | None = None) -> int:
             (output / name).unlink(missing_ok=True)
         api_key = os.environ.get(args.api_key_env) or config.get("api_key", "")
         core, skipped = make_core_jobs(dialogues, cases, args.model)
-        manifest_base = {"dialogue_count": len(dialogues), "total_dialogue_count": len(all_dialogues), "case_count": len(cases), "real_dialogue_count": len(real), "selection": selection}
+        manifest_base = {"dialogue_count": len(dialogues), "total_dialogue_count": len(all_dialogues), "case_count": len(cases), "real_dialogue_count": len(real), "real_reference_selection": {**real_audit, "case_ids": sorted(wanted_cases)}, "selection": selection}
         sim_ann = make_annotation_jobs(dialogues, args.model, args.annotation_batch_size, "sim") if real else []
         real_ann = make_annotation_jobs(real, args.model, args.annotation_batch_size, "real")
         jobs = core + sim_ann + real_ann
@@ -1047,12 +1146,13 @@ def main(argv: list[str] | None = None) -> int:
             validate_annotation_set(real_index, real)
             write_json(output / "annotations_simulated.json", a)
             write_json(output / "annotations_real.json", b)
-            scenario_by_id = {d.dialogue_id: scenario_key(d) for d in dialogues + real}
+            scenario_by_id = {d.dialogue_id: d.case_id for d in dialogues + real}
             for i, group in enumerate(group_chunks(dialogues, args.batch_size), 1):
                 subset = [{"dialogue_id": d.dialogue_id, "messages": sim_index[d.dialogue_id]} for d in group]
-                all_real = [{"dialogue_id": d.dialogue_id, "messages": real_index[d.dialogue_id]} for d in real]
-                stats_by_batch[f"batch_{i:03d}"] = feature_statistics(subset, all_real, args.min_comparison_n, args.comparison_setup, scenario_by_id)
-                coverage_by_batch[f"batch_{i:03d}"] = comparison_coverage(subset, all_real, stats_by_batch[f"batch_{i:03d}"], scenario_by_id)
+                batch_cases = {d.case_id for d in group}
+                matched_real = [{"dialogue_id": d.dialogue_id, "messages": real_index[d.dialogue_id]} for d in real if d.case_id in batch_cases]
+                stats_by_batch[f"batch_{i:03d}"] = feature_statistics(subset, matched_real, args.min_comparison_n, args.comparison_setup, scenario_by_id)
+                coverage_by_batch[f"batch_{i:03d}"] = comparison_coverage(subset, matched_real, stats_by_batch[f"batch_{i:03d}"], scenario_by_id)
             write_json(output / "feature_statistics.json", stats_by_batch)
             write_json(output / "comparison_coverage.json", coverage_by_batch)
             write_feature_statistics_csv(output / "feature_statistics.csv", stats_by_batch)
