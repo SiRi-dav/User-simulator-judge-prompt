@@ -375,6 +375,42 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(values["dialogues"], runner.ROOT / "data/dialogues")
         self.assertEqual(values["output"], runner.ROOT / "results")
 
+    def test_single_large_files_selection_and_resume(self):
+        dialogue_file = self.root / "all_dialogues.jsonl"
+        case_file = self.root / "all_cases.jsonl"
+        dialogues = [
+            {"case_id": f"CASE{i:03d}", "session_index": 1, "messages": [
+                {"role": "user", "content": "网络不通。"},
+                {"role": "assistant", "content": "重连后如何？"},
+                {"role": "user", "content": "还是不行。"},
+            ]} for i in (1, 2)
+        ]
+        runner.write_json(dialogue_file, dialogues)  # Historical .jsonl may contain a JSON array.
+        runner.write_json(case_file, [{"case_id": f"CASE{i:03d}", "text": ["网络不通，尚未重连。"]} for i in (1, 2)])
+        real_file = self.root / "all_real_dialogues.jsonl"
+        runner.write_json(real_file, [{"case_id": "REAL001", "session_index": 1, "messages": [
+            {"role": "user", "content": "网络不通。"},
+            {"role": "assistant", "content": "重连后如何？"},
+            {"role": "user", "content": "还是不行。"},
+        ]}])
+        args = ["--dialogues", str(dialogue_file), "--cases", str(case_file), "--real-dialogues", str(real_file), "--output", str(self.output), "--model", "mock", "--base-url", "http://mock", "--min-comparison-n", "1", "--start-dialogue", "2", "--limit-dialogues", "1"]
+        self.assertEqual(runner.main(args), 0)
+        run_output = self.output / "dialogues_00002-00002"
+        manifest = runner.read_json(run_output / "manifest.json")
+        self.assertEqual(manifest["selection"]["dialogue_ids"], ["CASE002#1"])
+        self.assertEqual(manifest["total_dialogue_count"], 2)
+        self.assertEqual(manifest["real_dialogue_count"], 1)
+        self.assertEqual(runner.read_json(run_output / "annotations_real.json")[0]["dialogue_id"], "REAL001#1")
+        self.assertTrue(all("CASE001#1" not in row["label"] for row in manifest["jobs"]))
+        calls = len(MockJudge.prompts)
+        self.assertEqual(runner.main(args), 0)
+        self.assertEqual(len(MockJudge.prompts), calls)
+        damaged = run_output / "results" / (manifest["jobs"][0]["job_id"] + ".json")
+        damaged.unlink()
+        self.assertEqual(runner.main(args), 0)
+        self.assertEqual(len(MockJudge.prompts), calls + 1)
+        self.assertEqual(runner.main(args[:-4] + ["--start-dialogue", "3", "--limit-dialogues", "1"]), 2)
+
     def test_http_adapter_uses_chat_completions_without_exposing_key(self):
         class Reply:
             def __enter__(self):

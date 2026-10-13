@@ -80,22 +80,39 @@ def read_api_config(path: Path, explicit: bool = False) -> dict[str, str]:
     return config
 
 
-def read_run_config(path: Path, explicit: bool = False) -> dict[str, Path]:
+def read_run_config(path: Path, explicit: bool = False) -> dict[str, Any]:
     if not path.exists():
         if explicit:
             raise ValueError(f"运行路径配置不存在：{path}")
         return {}
     config = read_json(path)
-    allowed = {"dialogues", "cases", "real_dialogues", "output"}
-    if not isinstance(config, dict) or any(key not in allowed or not isinstance(value, str) or not value.strip() for key, value in config.items()):
-        raise ValueError("运行路径配置仅支持非空字符串字段 dialogues、cases、real_dialogues、output")
-    return {key: Path(value) if Path(value).is_absolute() else ROOT / value for key, value in config.items()}
+    path_keys = {"dialogues", "cases", "real_dialogues", "output"}
+    allowed = path_keys | {"start_dialogue", "limit_dialogues"}
+    if not isinstance(config, dict) or any(key not in allowed for key in config):
+        raise ValueError("运行路径配置含无效字段")
+    result: dict[str, Any] = {}
+    for key in path_keys & config.keys():
+        value = config[key]
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"运行路径配置 {key} 必须是非空路径字符串")
+        result[key] = Path(value) if Path(value).is_absolute() else ROOT / value
+    for key in ("start_dialogue", "limit_dialogues"):
+        if key in config:
+            value = config[key]
+            if value is not None and (type(value) is not int or value < 1):
+                raise ValueError(f"运行路径配置 {key} 必须是正整数或 null")
+            result[key] = value
+    return result
 
 
-def list_files(folder: Path) -> list[Path]:
-    if not folder.is_dir():
-        raise ValueError(f"目录不存在：{folder}")
-    return sorted(p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED)
+def list_files(source: Path) -> list[Path]:
+    if source.is_file():
+        if source.suffix.lower() not in SUPPORTED:
+            raise ValueError(f"不支持的输入文件类型：{source}")
+        return [source]
+    if not source.is_dir():
+        raise ValueError(f"输入文件或目录不存在：{source}")
+    return sorted(p for p in source.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED)
 
 
 def json_records(path: Path) -> list[Any]:
@@ -868,7 +885,7 @@ def make_batch_jobs(dialogues: list[Dialogue], real: list[Dialogue], model: str,
     return jobs
 
 
-def summarize(output: Path, jobs: list[dict[str, Any]], skipped: list[dict[str, str]], preview: bool = False) -> dict[str, Any]:
+def summarize(output: Path, jobs: list[dict[str, Any]], skipped: list[dict[str, str]], preview: bool = False, selection: dict[str, Any] | None = None) -> dict[str, Any]:
     rows = []
     for item in jobs:
         path = output / "results" / (item["job_id"] + ".json")
@@ -880,6 +897,8 @@ def summarize(output: Path, jobs: list[dict[str, Any]], skipped: list[dict[str, 
     summary["assessment_counts"] = dict(Counter(f"{r['kind']}:{r['assessment_status']}" for r in rows if r["assessment_status"]))
     summary["batch_assessment_counts"] = {k: dict(Counter(r[k] for r in rows if r[k])) for k in ("B1", "B2", "B3")}
     summary["interpretation_warning"] = "completed/退出码0仅代表程序成功处理任务；partial、insufficient_evidence、not_applicable、descriptive_only和跳过项均不能解释为已通过评测。请同时查看 checks、limitations 和 comparison_coverage.json。"
+    if selection is not None:
+        summary["selection"] = selection
     write_json(output / "summary.json", summary)
     with (output / "results.csv").open("w", encoding="utf-8-sig", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=list(rows[0]) if rows else ["kind", "label", "job_id", "run_status", "assessment_status", "score", "B1", "B2", "B3", "error"])
@@ -890,15 +909,17 @@ def summarize(output: Path, jobs: list[dict[str, Any]], skipped: list[dict[str, 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="用户模拟器评测：读取对话与案例、调用兼容 Chat Completions 的模型、输出结果")
-    parser.add_argument("--dialogues", type=Path, help="模拟对话目录；默认从运行路径配置读取")
-    parser.add_argument("--cases", type=Path, help="案例目录；默认从运行路径配置读取")
-    parser.add_argument("--real-dialogues", type=Path, help="可选真人对话目录，供 B3 对照")
+    parser.add_argument("--dialogues", type=Path, help="模拟对话文件或目录；默认从运行路径配置读取")
+    parser.add_argument("--cases", type=Path, help="案例文件或目录；默认从运行路径配置读取")
+    parser.add_argument("--real-dialogues", type=Path, help="可选真人对话文件或目录，供 B3 对照")
     parser.add_argument("--output", type=Path, help="结果目录；默认从运行路径配置读取")
     parser.add_argument("--model", default=os.environ.get("EVAL_MODEL", ""), help="评测模型名；也可设 EVAL_MODEL")
     parser.add_argument("--base-url", default=os.environ.get("EVAL_BASE_URL", ""), help="兼容 OpenAI Chat Completions 的 /v1 地址；也可设 EVAL_BASE_URL")
     parser.add_argument("--api-key-env", default="EVAL_API_KEY", help="保存 API key 的环境变量名；本地无认证服务可不设")
     parser.add_argument("--api-config", type=Path, help="本机 API 配置 JSON；默认读取 eval_pipeline/.local_api.json（若存在）")
     parser.add_argument("--run-config", type=Path, help="输入与输出路径配置 JSON；默认读取 eval_pipeline/run_config.json")
+    parser.add_argument("--start-dialogue", type=int, help="从第几段模拟对话开始，按输入文件顺序，第一段为 1")
+    parser.add_argument("--limit-dialogues", type=int, help="本次最多评多少段模拟对话；与 --batch-size 不同")
     parser.add_argument("--batch-size", type=int, default=8, help="每个 Batch 任务包含多少段模拟对话")
     parser.add_argument("--annotation-batch-size", type=int, default=4, help="每个标注任务包含多少段对话")
     parser.add_argument("--min-comparison-n", type=int, default=5, help="B3 单个比较条件每组最少的 USER 消息数")
@@ -917,16 +938,22 @@ def main(argv: list[str] | None = None) -> int:
     args.model = args.model or config.get("model", "")
     args.base_url = args.base_url or config.get("base_url", "")
     use_config_real = args.dialogues is None and args.cases is None and args.real_dialogues is None
+    use_config_selection = args.dialogues is None and args.cases is None
     args.dialogues = args.dialogues or paths.get("dialogues")
     args.cases = args.cases or paths.get("cases")
     args.output = args.output or paths.get("output")
+    if args.start_dialogue is None:
+        args.start_dialogue = paths.get("start_dialogue") if use_config_selection else None
+    args.start_dialogue = args.start_dialogue or 1
+    if args.limit_dialogues is None and use_config_selection:
+        args.limit_dialogues = paths.get("limit_dialogues")
     real_from_config = use_config_real and "real_dialogues" in paths
     if use_config_real:
         args.real_dialogues = paths.get("real_dialogues")
     if not args.dialogues or not args.cases or not args.output:
-        parser.error("缺少模拟对话、案例或输出目录；请设置 eval_pipeline/run_config.json 或使用 --dialogues、--cases、--output")
-    if real_from_config and (not args.real_dialogues.is_dir() or not list_files(args.real_dialogues)):
-        print(f"真人对话目录尚无可读取文件，本次不执行 B3 真人对比：{args.real_dialogues}", file=sys.stderr)
+        parser.error("缺少模拟对话、案例或输出路径；请设置 eval_pipeline/run_config.json 或使用 --dialogues、--cases、--output")
+    if real_from_config and (not args.real_dialogues.exists() or not list_files(args.real_dialogues)):
+        print(f"真人对话路径尚无可读取文件，本次不执行 B3 真人对比：{args.real_dialogues}", file=sys.stderr)
         args.real_dialogues = None
     if not args.model:
         parser.error("缺少 --model 或 EVAL_MODEL")
@@ -934,12 +961,21 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("缺少 --base-url 或 EVAL_BASE_URL")
     if min(args.batch_size, args.annotation_batch_size, args.min_comparison_n) < 1 or args.retries < 0 or args.timeout <= 0:
         parser.error("批量大小和最小样本数必须为正数，重试次数不能为负")
+    if args.start_dialogue < 1 or args.limit_dialogues is not None and args.limit_dialogues < 1:
+        parser.error("--start-dialogue 和 --limit-dialogues 必须是正整数")
     try:
-        output = args.output.resolve()
+        output_root = args.output.resolve()
         for source in (args.dialogues, args.cases, args.real_dialogues):
-            if source and output.is_relative_to(source.resolve()):
+            if source and source.is_dir() and output_root.is_relative_to(source.resolve()):
                 raise ValueError("输出目录不能位于对话、案例或真人对话输入目录内")
-        dialogues = load_dialogues(args.dialogues)
+        all_dialogues = load_dialogues(args.dialogues)
+        if args.start_dialogue > len(all_dialogues):
+            raise ValueError(f"起始序号 {args.start_dialogue} 超出模拟对话总数 {len(all_dialogues)}")
+        start_index = args.start_dialogue - 1
+        dialogues = all_dialogues[start_index:start_index + args.limit_dialogues if args.limit_dialogues else None]
+        end_index = start_index + len(dialogues)
+        selection = {"total_dialogues": len(all_dialogues), "start_dialogue": args.start_dialogue, "end_dialogue": end_index, "selected_count": len(dialogues), "limit_dialogues": args.limit_dialogues, "dialogue_ids": [d.dialogue_id for d in dialogues]}
+        output = output_root / f"dialogues_{args.start_dialogue:05d}-{end_index:05d}" if args.limit_dialogues is not None or args.start_dialogue != 1 else output_root
         cases = load_cases(args.cases)
         real = load_dialogues(args.real_dialogues) if args.real_dialogues else []
         if real and set(d.dialogue_id for d in real) & set(d.dialogue_id for d in dialogues):
@@ -952,6 +988,7 @@ def main(argv: list[str] | None = None) -> int:
             (output / name).unlink(missing_ok=True)
         api_key = os.environ.get(args.api_key_env) or config.get("api_key", "")
         core, skipped = make_core_jobs(dialogues, cases, args.model)
+        manifest_base = {"dialogue_count": len(dialogues), "total_dialogue_count": len(all_dialogues), "case_count": len(cases), "real_dialogue_count": len(real), "selection": selection}
         sim_ann = make_annotation_jobs(dialogues, args.model, args.annotation_batch_size, "sim") if real else []
         real_ann = make_annotation_jobs(real, args.model, args.annotation_batch_size, "real")
         jobs = core + sim_ann + real_ann
@@ -960,14 +997,14 @@ def main(argv: list[str] | None = None) -> int:
         for item in jobs:
             (requests_dir / f"{item['job_id']}.txt").write_text(item["prompt"], encoding="utf-8")
         # Save requests locally for review. They may contain internal dialogue/case text.
-        write_json(output / "manifest.json", {"dialogue_count": len(dialogues), "case_count": len(cases), "real_dialogue_count": len(real), "jobs": [{k: v for k, v in j.items() if k != "prompt" and not k.startswith("_")} for j in jobs], "skipped": skipped})
+        write_json(output / "manifest.json", {**manifest_base, "jobs": [{k: v for k, v in j.items() if k != "prompt" and not k.startswith("_")} for j in jobs], "skipped": skipped})
         if args.dry_run:
             preview = make_batch_jobs(dialogues, real, args.model, args.batch_size, {}, args.target_population, args.comparison_setup)
             jobs += preview
             for item in preview:
                 (requests_dir / f"{item['job_id']}.txt").write_text(item["prompt"], encoding="utf-8")
-            write_json(output / "manifest.json", {"dialogue_count": len(dialogues), "case_count": len(cases), "real_dialogue_count": len(real), "jobs": [{k: v for k, v in j.items() if k != "prompt" and not k.startswith("_")} for j in jobs], "skipped": skipped, "note": "Batch任务为预览；真人统计在标注完成后生成，实际 Batch 请求ID会变化"})
-            summarize(output, jobs, skipped, preview=True)
+            write_json(output / "manifest.json", {**manifest_base, "jobs": [{k: v for k, v in j.items() if k != "prompt" and not k.startswith("_")} for j in jobs], "skipped": skipped, "note": "Batch任务为预览；真人统计在标注完成后生成，实际 Batch 请求ID会变化"})
+            summarize(output, jobs, skipped, preview=True, selection=selection)
             print(f"准备完成：{len(jobs)} 个任务，{len(skipped)} 个跳过；没有调用模型。结果：{output}")
             return 0
         ok, failed = execute_jobs(core + sim_ann + real_ann, output, args.base_url, api_key, args.timeout, args.retries, False, args.force)
@@ -977,8 +1014,8 @@ def main(argv: list[str] | None = None) -> int:
             a, b = annotations_for(sim_ann, output), annotations_for(real_ann, output)
             if a is None or b is None:
                 skipped.append({"kind": "expression_realism_batch", "dialogue_id": "all", "reason": "真人对照标注未全部成功；修复后重跑，避免把 B3 误记为未评估"})
-                write_json(output / "manifest.json", {"dialogue_count": len(dialogues), "case_count": len(cases), "real_dialogue_count": len(real), "jobs": [{k: v for k, v in j.items() if k != "prompt" and not k.startswith("_")} for j in jobs], "skipped": skipped})
-                summarize(output, jobs, skipped)
+                write_json(output / "manifest.json", {**manifest_base, "jobs": [{k: v for k, v in j.items() if k != "prompt" and not k.startswith("_")} for j in jobs], "skipped": skipped})
+                summarize(output, jobs, skipped, selection=selection)
                 return 1
             sim_index = annotation_index(a)
             real_index = annotation_index(b)
@@ -999,9 +1036,9 @@ def main(argv: list[str] | None = None) -> int:
         jobs += batch_jobs
         for item in batch_jobs:
             (requests_dir / f"{item['job_id']}.txt").write_text(item["prompt"], encoding="utf-8")
-        write_json(output / "manifest.json", {"dialogue_count": len(dialogues), "case_count": len(cases), "real_dialogue_count": len(real), "jobs": [{k: v for k, v in j.items() if k != "prompt" and not k.startswith("_")} for j in jobs], "skipped": skipped, "feature_stat_count": sum(len(v) for v in stats_by_batch.values())})
+        write_json(output / "manifest.json", {**manifest_base, "jobs": [{k: v for k, v in j.items() if k != "prompt" and not k.startswith("_")} for j in jobs], "skipped": skipped, "feature_stat_count": sum(len(v) for v in stats_by_batch.values())})
         more_ok, more_failed = execute_jobs(batch_jobs, output, args.base_url, api_key, args.timeout, args.retries, False, args.force)
-        summary = summarize(output, jobs, skipped)
+        summary = summarize(output, jobs, skipped, selection=selection)
         print(f"完成 {ok+more_ok}，失败 {failed+more_failed}，跳过 {len(skipped)}；结果：{output}")
         return 1 if failed + more_failed else 0
     except (ValueError, OSError, json.JSONDecodeError) as exc:

@@ -12,13 +12,28 @@
 
 当前项目已按用户授权把公司接口配置放在 `eval_pipeline/.local_api.json`：地址、模型名与密钥均由程序自动读取，并随私有仓库同步。不要把它复制到公开仓库或结果目录。环境变量和命令行中的模型/地址会覆盖本机配置；`EVAL_API_KEY` 会覆盖配置中的密钥。换机器时也可用 `--api-config /path/to/private-config.json` 指定另一份同格式文件。
 
-输入与输出路径可以在 `eval_pipeline/run_config.json` 中设置一次。默认值是仓库根目录下的 `data/dialogues`（模拟对话）、`data/cases`（案例）、`data/real_dialogues`（真人对话）和 `results`（输出）。相对路径以仓库根目录为准，与当前终端所在目录无关。准备好数据后，从仓库根目录直接运行 `python3 -m eval_pipeline.runner`；Windows 可运行 `run_eval.bat`。真人目录不存在或没有受支持文件时，本次自动跳过 B3 真人对比，并显示提示。
+输入与输出路径可以在 `eval_pipeline/run_config.json` 中设置一次，路径可以指向**单个大文件**或目录。默认值是仓库根目录下的 `data/simulated_dialogues.jsonl`（模拟对话）、`data/cases.jsonl`（案例）、`data/real_dialogues.jsonl`（真人对话）和 `results`（输出）。相对路径以仓库根目录为准，与当前终端所在目录无关。准备好数据后，从仓库根目录直接运行 `python3 -m eval_pipeline.runner`；Windows 可运行 `run_eval.bat`。真人文件或目录不存在、为空时，本次自动跳过 B3 真人对比，并显示提示。
 
-命令行的 `--dialogues`、`--cases`、`--real-dialogues`、`--output` 可临时覆盖配置；也可以用 `--run-config` 指定另一份路径配置。输入目录要分开，输出不能放在任一输入目录内。当前仓库已获授权纳入公司 API 配置，克隆时会得到它；请按项目访问权限管理仓库和本地副本。
+当前配置默认 `start_dialogue: 1`、`limit_dialogues: 10`，即按输入记录顺序先评前 10 段模拟对话；改成 `limit_dialogues: 20` 则评前 20 段。要评下一组 10 段，设 `start_dialogue: 11`、`limit_dialogues: 10`。将 `limit_dialogues` 设为 `null` 可从起始序号一直评到结尾。也可临时用 `--start-dialogue`、`--limit-dialogues` 覆盖配置。`--batch-size` 仅控制一个 Batch 诊断请求里放几段，**不控制本次总数**。
+
+选择部分对话时，结果放在 `results/dialogues_00001-00010/` 这类独立目录；每个任务完成后立即保存 JSON，重跑同一组会复用有效完成结果，失败和未完成任务继续执行。运行期间被中断的那一个模型请求需要重新发送。修改输入内容、prompt、模型、服务地址或选取范围可能产生新任务；不同组的 summary 不自动合并为一个总表。
+
+命令行的 `--dialogues`、`--cases`、`--real-dialogues`、`--output` 可临时覆盖配置；也可以用 `--run-config` 指定另一份路径配置。若使用目录输入，输出不能放在任一输入目录内。当前仓库已获授权纳入公司 API 配置，克隆时会得到它；请按项目访问权限管理仓库和本地副本。
 
 2026-10-13 在当前机器尝试连接该内网服务，TCP 端口超时；请求未到达模型。请在能访问该内网地址的网络环境下再做短请求验证，然后运行示例评测。此时无法判断密钥、模型名和服务返回格式是否有效。
 
-## 输入目录
+## 输入文件
+
+最常用的是三个各自包含全部记录的大文件，文件名和位置可自行设置：
+
+```text
+my_data/
+  simulated_dialogues.jsonl  # 必填：全部模拟对话
+  cases.jsonl                # 必填：全部案例
+  real_dialogues.jsonl       # 可选：全部真人对话
+```
+
+每个文件可以是 JSON 对象数组，也可以每行一个 JSON 对象。模拟对话和真人对话中的每条记录都要有 `case_id`、`session_index` 和 `messages`；案例中的每条记录要有 `case_id` 和 `text`。各文件按记录读取，不需要拆成一个记录一个文件。以下旧式目录结构也可继续使用：
 
 ```text
 my_data/
@@ -32,7 +47,7 @@ my_data/
     REAL001#1.md
 ```
 
-模拟对话支持每文件一个或多个 Markdown 会话，也支持 `.json` / `.jsonl` 中的单对象、对象数组或真正逐行 JSON。扩展名为 `.jsonl` 但内容是 JSON 数组的历史文件也能读。会递归读取子目录。
+模拟对话支持单个 Markdown 文件中的一段或多段会话，也支持 `.json` / `.jsonl` 中的单对象、对象数组或真正逐行 JSON；扩展名为 `.jsonl` 但内容是 JSON 数组的历史文件也能读。给目录时会递归读取子目录。案例和真人对话同样支持直接指定单个大文件。
 
 Markdown 格式：
 
@@ -74,7 +89,7 @@ JSON 格式：
 
 案例通过 `case_id` **精确匹配**模拟对话。找不到案例或案例正文为空时，信息泄漏任务会记录为跳过，其他可评任务继续。历史 `case_analysis_debug710.jsonl` 的 `target_case` 也能读取，但它是归一化快照，不能自动代表已核验的原始案例。
 
-请将原始对话与案例放在单独的输入目录，输出目录不要建在输入目录内。图片链接只会作为文字传入，不下载或读取图片。
+请分别指定模拟对话与案例的输入路径。若输入为目录，输出目录不要建在输入目录内。图片链接只会作为文字传入，不下载或读取图片。
 
 ## 最快运行方式
 
@@ -168,4 +183,4 @@ summary 同时提供执行状态、评分状态和 B1/B2/B3 状态计数。退�
 
 ## 当前仓库数据直接试跑
 
-仓库的 `710数据/all_simulation_transcripts.jsonl` 虽有 `.jsonl` 后缀，内容实际是 JSON 数组。请先将它**单独复制**到一个 `dialogues/` 目录，不要把 `710数据/` 整个目录作为对话输入，否则其他日志会被当作对话读入。案例可将 `710数据/case_analysis_debug710.jsonl` 单独放入 `cases/`，但其内容属于历史归一化快照；信息泄漏结论仍应以核验后的原始案例复核。
+仓库的 `710数据/all_simulation_transcripts.jsonl` 虽有 `.jsonl` 后缀，内容实际是 JSON 数组，可直接把这个文件路径填在 `dialogues` 中。不要把 `710数据/` 整个目录作为对话输入，否则其他日志会被当作对话读入。案例路径可直接指向 `710数据/case_analysis_debug710.jsonl`，但其内容属于历史归一化快照；信息泄漏结论仍应以核验后的原始案例复核。

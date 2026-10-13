@@ -1,6 +1,8 @@
 {
-  "dialogues": "data/dialogues",
-  "cases": "data/cases",
-  "real_dialogues": "data/real_dialogues",
-  "output": "results"
+  "dialogues": "data/simulated_dialogues.jsonl",
+  "cases": "data/cases.jsonl",
+  "real_dialogues": "data/real_dialogues.jsonl",
+  "output": "results",
+  "start_dialogue": 1,
+  "limit_dialogues": 10
 }
