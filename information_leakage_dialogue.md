@@ -24,7 +24,7 @@
 ## 输入解析与案例匹配
 
 1. 每次评价一段会话。读取 case_id 与 session_index；缺失时可从明确的“案例ID#会话序号”标题提取。标题与字段冲突，或输入包含多段会话且无法唯一确定目标时，返回 insufficient_evidence，不自行选第一段。
-2. 对案例库 JSON，按 case_id 精确匹配顶层键，只使用该条目的 case_name 和 text。找不到目标、没有 ID 无法匹配、或同一 ID 对应冲突条目时，返回 insufficient_evidence；不能改选主题相似或相邻条目。若只有一个不带 ID 的案例原文，可作为显式配对材料使用，但在 limitations 说明无法核验 ID；内容明显不对应时不评分。
+2. 对案例库 JSON，按 case_id 精确匹配顶层键，只使用该条目的 case_name 和 text 作为案例事实。若附有 source_note，它仅说明材料来源和完整性限制，必须保留这一限制，不能当作案例事实或用户当时的知识。找不到目标、没有 ID 无法匹配、或同一 ID 对应冲突条目时，返回 insufficient_evidence；不能改选主题相似或相邻条目。若只有一个不带 ID 的案例原文，可作为显式配对材料使用，但在 limitations 说明无法核验 ID；内容明显不对应时不评分。
 3. 识别正文中用于分隔消息的 User／Assistant 角色标记，不区分大小写，忽略标记外层的 Markdown 加粗。角色标记下一行也可开始正文，多行内容直到下一个消息边界都属于同一消息。正文引用或代码块中的角色文字不作为新消息。标题、元数据、空行不算消息。
 4. 如果所有消息已有唯一明确编号，沿用其类型和值，numbering 为 provided；如果均无编号，按 USER 与 ASSISTANT 混合出现的实际顺序，从 1 连续编号，numbering 为 generated。编号不按 USER 单独计数。部分消息有编号或编号重复等情况若不能唯一定位，返回 insufficient_evidence，不静默改号。
 5. 按实际正文统计 message_count 和 user_message_count。turn_count 不用于截断正文或推算 USER 数量；例如 3 轮交互可能含开场在内的 4 条 USER 消息。数量口径不同本身不扣分。solution_status 和 stop_reason 仅是结果元数据，不是 USER 发言、当时知识、操作证据或扣分依据。

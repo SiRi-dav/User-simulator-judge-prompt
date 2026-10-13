@@ -1,0 +1,5 @@
+{
+  "base_url": "http://10.67.43.7:12345/v1",
+  "model": "qwen3",
+  "api_key": "sk-1234"
+}
