@@ -491,6 +491,15 @@ def make_annotation_jobs(dialogues: list[Dialogue], model: str, count: int, set_
 
 def parse_model_json(raw: str) -> dict[str, Any]:
     s = raw.strip()
+    # Some Qwen deployments place a complete reasoning block in content.
+    # Never extract a tentative JSON object from inside that block.
+    while s.startswith("<think>"):
+        end = s.find("</think>", len("<think>"))
+        if end < 0:
+            raise ValueError("模型思考块未闭合，未取得完整最终 JSON")
+        s = s[end + len("</think>"):].strip()
+    if not s:
+        raise ValueError("模型未返回最终 JSON（可能只返回了思考内容）")
     if s.startswith("```"):
         s = re.sub(r"^```(?:json)?\s*|\s*```$", "", s, flags=re.I).strip()
     value = json.loads(s)
@@ -658,6 +667,21 @@ def execute_jobs(jobs: list[dict[str, Any]], output: Path, base_url: str | None,
                 if old.get("status") == "completed" and old.get("prompt_sha256") == item["prompt_sha256"] and old.get("model") == item["model"] and old.get("service_sha256") == service_sha256:
                     validate_job_result(item, old["result"])
                     ok += 1
+                    continue
+                if (not dry_run and old.get("status") == "failed"
+                        and old.get("prompt_sha256") == item["prompt_sha256"]
+                        and old.get("model") == item["model"]
+                        and old.get("service_sha256") == service_sha256
+                        and isinstance(old.get("raw_response"), str)
+                        and isinstance(old.get("api"), dict)
+                        and old["api"].get("finish_reason") in {None, "stop"}):
+                    parsed = parse_model_json(old["raw_response"])
+                    validate_job_result(item, parsed)
+                    old.update(status="completed", result=parsed, recovered_from_raw_response=True)
+                    old.pop("error", None)
+                    write_json(dest, old)
+                    ok += 1
+                    print(f"[{n}/{len(jobs)}] {item['kind']} {item['label']}: recovered（复用已保存回复）", flush=True)
                     continue
             except (ValueError, KeyError, IndexError, TypeError, AttributeError):
                 pass  # A stale or damaged cache entry is regenerated below.
