@@ -1353,7 +1353,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--min-comparison-n", type=int, default=5, help="B3 单个比较条件每组最少的 USER 消息数")
     parser.add_argument("--target-population", default="未提供", help="B2 目标用户及覆盖要求；未知则只描述")
     parser.add_argument("--comparison-setup", default="未核验；需检查案例、助手、开头和生成设置差异", help="两组可比性说明")
-    parser.add_argument("--timeout", type=float, default=120)
+    parser.add_argument("--timeout", type=float, default=300, help="每次模型请求等待秒数；默认 300 秒，作用于所有评测任务")
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument("--dry-run", action="store_true", help="生成任务清单，不调用模型")
     parser.add_argument("--force", action="store_true", help="忽略成功缓存重新调用；重复性试验应分别使用新的输出目录")
