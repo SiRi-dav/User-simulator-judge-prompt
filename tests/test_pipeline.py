@@ -6,6 +6,7 @@ import io
 import json
 import re
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -83,6 +84,59 @@ class PipelineTests(unittest.TestCase):
     def run_main(self, args=None):
         with contextlib.redirect_stdout(io.StringIO()):
             return r.main(self.args if args is None else args)
+
+    def test_parallel_limit_failure_persistence_and_resume(self):
+        # Each pair must reach the model together: serial dispatch cannot pass.
+        gate = threading.Barrier(2, timeout=5)
+        lock = threading.Lock()
+        active = peak = 0
+        items = [{'job_id': str(i), 'kind': 'natural_flow_dialogue', 'label': str(i),
+                  'model': 'mock', 'prompt_sha256': str(i), 'prompt': str(i)} for i in range(4)]
+
+        def model(prompt, *args):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            try:
+                gate.wait()
+                if prompt == '1':
+                    raise RuntimeError('模拟服务故障')
+                return json.dumps({'assessment_status': 'scored', 'score': 5,
+                                   'checks': checks('D'), 'issues': []}), {'finish_reason': 'stop'}
+            finally:
+                with lock:
+                    active -= 1
+
+        with patch.object(r, 'call_model', side_effect=model), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(r.execute_jobs(items, self.out, 'http://mock.invalid/v1', '', 1, 0, False, workers=2), (3, 1))
+        self.assertEqual(peak, 2)
+        for item in items:
+            record = r.read_json(self.out / 'results' / (item['job_id'] + '.json'))
+            self.assertEqual(record['status'], 'failed' if item['job_id'] == '1' else 'completed')
+            self.assertIn('elapsed_seconds', record)
+        good = json.dumps({'assessment_status': 'scored', 'score': 5, 'checks': checks('D'), 'issues': []})
+        with patch.object(r, 'call_model', return_value=(good, {'finish_reason': 'stop'})) as mock, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(r.execute_jobs(items, self.out, 'http://mock.invalid/v1', '', 1, 0, False, workers=3), (4, 0))
+            self.assertEqual(mock.call_count, 1)
+            self.assertEqual(mock.call_args.args[0], '1')
+
+    def test_interrupt_stops_dispatch_and_keeps_finished_results(self):
+        items = [{'job_id': str(i), 'kind': 'natural_flow_dialogue', 'label': str(i),
+                  'model': 'mock', 'prompt_sha256': str(i), 'prompt': str(i)} for i in range(8)]
+        good = json.dumps({'assessment_status': 'scored', 'score': 5, 'checks': checks('D'), 'issues': []})
+        with patch.object(r, 'call_model', return_value=(good, {'finish_reason': 'stop'})) as mock, \
+                patch.object(r, 'wait', side_effect=KeyboardInterrupt), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                r.execute_jobs(items, self.out, 'http://mock.invalid/v1', '', 1, 0, False, workers=2)
+        self.assertLessEqual(mock.call_count, 2)
+        self.assertEqual(len(list((self.out / 'results').glob('*.json'))), mock.call_count)
+
+    def test_duplicate_jobs_rejected_before_concurrent_writes(self):
+        with patch.object(r, 'call_model') as mock:
+            with self.assertRaisesRegex(ValueError, '任务编号重复'):
+                r.execute_jobs([{'job_id': 'same'}] * 2, self.out, '', '', 1, 0, False, workers=2)
+            mock.assert_not_called()
 
     def test_end_to_end_scores_evidence_labels_and_resume(self):
         with patch.object(r, 'call_model', side_effect=judge) as mock:

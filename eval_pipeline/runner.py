@@ -15,6 +15,7 @@ import sys
 import time
 import unicodedata
 from collections import Counter, defaultdict
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import median
@@ -932,57 +933,94 @@ def validate_job_result(item: dict[str, Any], data: dict[str, Any]) -> None:
             raise ValueError("未提供目标人群时 B2 只能描述或标记证据不足")
 
 
-def execute_jobs(jobs: list[dict[str, Any]], output: Path, base_url: str | None, api_key: str, timeout: float, retries: int, dry_run: bool, force: bool = False) -> tuple[int, int]:
+def _execute_job(item: dict[str, Any], result_dir: Path, base_url: str | None, api_key: str, timeout: float, retries: int, dry_run: bool, force: bool) -> tuple[str, str]:
+    dest = result_dir / (item["job_id"] + ".json")
+    service_sha256 = digest(api_endpoint(base_url or ""))
+    if dest.exists() and not force:
+        try:
+            old = read_json(dest)
+            if old.get("status") == "completed" and old.get("prompt_sha256") == item["prompt_sha256"] and old.get("model") == item["model"] and old.get("service_sha256") == service_sha256:
+                validate_job_result(item, old["result"])
+                return "cached", ""
+            if (not dry_run and old.get("status") == "failed"
+                    and old.get("prompt_sha256") == item["prompt_sha256"]
+                    and old.get("model") == item["model"]
+                    and old.get("service_sha256") == service_sha256
+                    and isinstance(old.get("raw_response"), str)
+                    and isinstance(old.get("api"), dict)
+                    and old["api"].get("finish_reason") in {None, "stop"}):
+                parsed = normalize_model_result(item["kind"], parse_model_json(old["raw_response"]))
+                validate_job_result(item, parsed)
+                old.update(status="completed", result=parsed, recovered_from_raw_response=True)
+                old.pop("error", None)
+                write_json(dest, old)
+                return "recovered", "（复用已保存回复）"
+        except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+            pass  # A stale or damaged cache entry is regenerated below.
+    if dry_run:
+        return "not_run", ""
+    started = time.monotonic()
+    raw, meta = None, {}
+    try:
+        raw, meta = call_model(item["prompt"], item["model"], base_url or "", api_key, timeout, retries)
+        if meta.get("finish_reason") not in {None, "stop"}:
+            raise ValueError(f"模型未正常结束：finish_reason={meta['finish_reason']}")
+        parsed = normalize_model_result(item["kind"], parse_model_json(raw))
+        validate_job_result(item, parsed)
+        record = {"job_id": item["job_id"], "kind": item["kind"], "label": item["label"], "model": item["model"], "prompt_sha256": item["prompt_sha256"], "status": "completed", "result": parsed, "api": meta}
+    except (ValueError, KeyError, IndexError, TypeError, AttributeError, RuntimeError, OSError) as exc:
+        record = {"job_id": item["job_id"], "kind": item["kind"], "label": item["label"], "model": item["model"], "prompt_sha256": item["prompt_sha256"], "status": "failed", "error": str(exc)}
+        record["raw_response"] = raw
+        record["api"] = meta
+    record["service_sha256"] = service_sha256
+    record["elapsed_seconds"] = round(time.monotonic() - started, 2)
+    write_json(dest, record)
+    detail = f"；原因：{record['error'][:240]}" if record["status"] == "failed" else ""
+    return record["status"], f"；耗时 {record['elapsed_seconds']} 秒{detail}"
+
+
+def execute_jobs(jobs: list[dict[str, Any]], output: Path, base_url: str | None, api_key: str, timeout: float, retries: int, dry_run: bool, force: bool = False, workers: int = 1) -> tuple[int, int]:
+    if workers < 1:
+        raise ValueError("workers 必须为正整数")
+    if len({item["job_id"] for item in jobs}) != len(jobs):
+        raise ValueError("任务编号重复，不能安全写入结果")
     result_dir = output / "results"
     result_dir.mkdir(parents=True, exist_ok=True)
-    ok = failed = 0
-    for n, item in enumerate(jobs, 1):
-        dest = result_dir / (item["job_id"] + ".json")
-        service_sha256 = digest(api_endpoint(base_url or ""))
-        if dest.exists() and not force:
-            try:
-                old = read_json(dest)
-                if old.get("status") == "completed" and old.get("prompt_sha256") == item["prompt_sha256"] and old.get("model") == item["model"] and old.get("service_sha256") == service_sha256:
-                    validate_job_result(item, old["result"])
-                    ok += 1
-                    continue
-                if (not dry_run and old.get("status") == "failed"
-                        and old.get("prompt_sha256") == item["prompt_sha256"]
-                        and old.get("model") == item["model"]
-                        and old.get("service_sha256") == service_sha256
-                        and isinstance(old.get("raw_response"), str)
-                        and isinstance(old.get("api"), dict)
-                        and old["api"].get("finish_reason") in {None, "stop"}):
-                    parsed = normalize_model_result(item["kind"], parse_model_json(old["raw_response"]))
-                    validate_job_result(item, parsed)
-                    old.update(status="completed", result=parsed, recovered_from_raw_response=True)
-                    old.pop("error", None)
-                    write_json(dest, old)
-                    ok += 1
-                    print(f"[{n}/{len(jobs)}] {item['kind']} {item['label']}: recovered（复用已保存回复）", flush=True)
-                    continue
-            except (ValueError, KeyError, IndexError, TypeError, AttributeError):
-                pass  # A stale or damaged cache entry is regenerated below.
-        if dry_run:
-            continue
-        raw, meta = None, {}
-        try:
-            raw, meta = call_model(item["prompt"], item["model"], base_url or "", api_key, timeout, retries)
-            if meta.get("finish_reason") not in {None, "stop"}:
-                raise ValueError(f"模型未正常结束：finish_reason={meta['finish_reason']}")
-            parsed = normalize_model_result(item["kind"], parse_model_json(raw))
-            validate_job_result(item, parsed)
-            record = {"job_id": item["job_id"], "kind": item["kind"], "label": item["label"], "model": item["model"], "prompt_sha256": item["prompt_sha256"], "status": "completed", "result": parsed, "api": meta}
-            ok += 1
-        except (ValueError, KeyError, IndexError, TypeError, AttributeError, RuntimeError, OSError) as exc:
-            record = {"job_id": item["job_id"], "kind": item["kind"], "label": item["label"], "model": item["model"], "prompt_sha256": item["prompt_sha256"], "status": "failed", "error": str(exc)}
-            failed += 1
-            record["raw_response"] = raw
-            record["api"] = meta
-        record["service_sha256"] = service_sha256
-        write_json(dest, record)
-        detail = f"；原因：{record['error'][:240]}" if record["status"] == "failed" else ""
-        print(f"[{n}/{len(jobs)}] {item['kind']} {item['label']}: {record['status']}{detail}", flush=True)
+    if not jobs:
+        return 0, 0
+    print(f"本阶段 {len(jobs)} 个任务，并发上限 {workers}（成功缓存直接复用）", flush=True)
+    ok = failed = finished = 0
+    remaining = iter(jobs)
+    pool = ThreadPoolExecutor(max_workers=workers)
+    pending = {}
+
+    def submit_next():
+        item = next(remaining, None)
+        if item is not None:
+            future = pool.submit(_execute_job, item, result_dir, base_url, api_key, timeout, retries, dry_run, force)
+            pending[future] = item
+
+    try:
+        for _ in range(min(workers, len(jobs))):
+            submit_next()
+        while pending:
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                item = pending.pop(future)
+                status, detail = future.result()
+                finished += 1
+                ok += status in {"completed", "cached", "recovered"}
+                failed += status == "failed"
+                print(f"[{finished}/{len(jobs)}] {item['kind']} {item['label']}: {status}{detail}", flush=True)
+            for _ in done:
+                submit_next()
+    except KeyboardInterrupt:
+        print("已停止派发新任务；正在等待已发出的请求结束并保存结果。再次运行会复用成功结果。", flush=True)
+        for future in pending:
+            future.cancel()
+        raise
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
     return ok, failed
 
 
@@ -1354,6 +1392,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--target-population", default="未提供", help="B2 目标用户及覆盖要求；未知则只描述")
     parser.add_argument("--comparison-setup", default="未核验；需检查案例、助手、开头和生成设置差异", help="两组可比性说明")
     parser.add_argument("--timeout", type=float, default=300, help="每次模型请求等待秒数；默认 300 秒，作用于所有评测任务")
+    parser.add_argument("--workers", type=int, default=3, help="同时执行的模型任务数；默认 3，服务拥堵时设为 1")
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument("--dry-run", action="store_true", help="生成任务清单，不调用模型")
     parser.add_argument("--force", action="store_true", help="忽略成功缓存重新调用；重复性试验应分别使用新的输出目录")
@@ -1387,8 +1426,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("缺少 --model 或 EVAL_MODEL")
     if not args.dry_run and not args.base_url:
         parser.error("缺少 --base-url 或 EVAL_BASE_URL")
-    if min(args.batch_size, args.annotation_batch_size, args.min_comparison_n) < 1 or args.retries < 0 or args.timeout <= 0:
-        parser.error("批量大小和最小样本数必须为正数，重试次数不能为负")
+    if min(args.batch_size, args.annotation_batch_size, args.min_comparison_n, args.workers) < 1 or args.retries < 0 or args.timeout <= 0:
+        parser.error("并发数、批量大小和最小样本数必须为正数，重试次数不能为负")
     if args.start_dialogue < 1 or args.limit_dialogues is not None and args.limit_dialogues < 1:
         parser.error("--start-dialogue 和 --limit-dialogues 必须是正整数")
     try:
@@ -1443,7 +1482,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         # Shared across slices, versioned by case text, prompt, model and service.
         case_cache = output_root / "case_evidence" / digest(api_endpoint(args.base_url))[:16]
-        case_ok, case_failed = execute_jobs(case_jobs, case_cache, args.base_url, api_key, args.timeout, args.retries, False, args.force)
+        case_ok, case_failed = execute_jobs(case_jobs, case_cache, args.base_url, api_key, args.timeout, args.retries, False, args.force, workers=args.workers)
         evidence = {}
         evidence_files = {}
         for item in case_jobs:
@@ -1462,7 +1501,7 @@ def main(argv: list[str] | None = None) -> int:
             (requests_dir / f"{item['job_id']}.txt").write_text(item["prompt"], encoding="utf-8")
         write_json(output / "manifest.json", {**manifest_base, "case_evidence": evidence_files, "jobs": [{k: v for k, v in j.items() if k != "prompt" and not k.startswith("_")} for j in jobs], "skipped": skipped})
         manifest_base["case_evidence"] = evidence_files
-        ok, failed = execute_jobs(core + sim_ann + real_ann, output, args.base_url, api_key, args.timeout, args.retries, False, args.force)
+        ok, failed = execute_jobs(core + sim_ann + real_ann, output, args.base_url, api_key, args.timeout, args.retries, False, args.force, workers=args.workers)
         ok += case_ok
         failed += case_failed
         stats_by_batch = {}
@@ -1495,7 +1534,7 @@ def main(argv: list[str] | None = None) -> int:
         for item in batch_jobs:
             (requests_dir / f"{item['job_id']}.txt").write_text(item["prompt"], encoding="utf-8")
         write_json(output / "manifest.json", {**manifest_base, "jobs": [{k: v for k, v in j.items() if k != "prompt" and not k.startswith("_")} for j in jobs], "skipped": skipped, "feature_stat_count": sum(len(v) for v in stats_by_batch.values())})
-        more_ok, more_failed = execute_jobs(batch_jobs, output, args.base_url, api_key, args.timeout, args.retries, False, args.force)
+        more_ok, more_failed = execute_jobs(batch_jobs, output, args.base_url, api_key, args.timeout, args.retries, False, args.force, workers=args.workers)
         summary = summarize(output, jobs, skipped, selection=selection)
         print(f"完成 {ok+more_ok}，失败 {failed+more_failed}，跳过 {len(skipped)}；结果：{output}")
         return 1 if failed + more_failed else 0
