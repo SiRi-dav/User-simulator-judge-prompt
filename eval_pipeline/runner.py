@@ -621,8 +621,15 @@ def validate_output(kind: str, data: dict[str, Any], b3_stat_ids: list[str] | No
             if not isinstance(fact, dict) or not isinstance(fact.get("fact_id"), str) or not re.fullmatch(r"F[1-9][0-9]*", fact["fact_id"]) or fact["fact_id"] in ids:
                 raise ValueError("案例事实编号无效或重复")
             ids.add(fact["fact_id"])
-            if "level" not in fact or fact["level"] is not None and (type(fact["level"]) is not int or fact["level"] not in {1, 2, 3}) or type(fact.get("is_answer")) is not bool or fact.get("importance") not in {"low", "medium", "high"}:
-                raise ValueError("案例事实分级无效")
+            field_rules = {
+                "level": ("level" in fact and (fact["level"] is None or type(fact["level"]) is int and fact["level"] in {1, 2, 3}), "整数 1/2/3 或 null"),
+                "is_answer": (type(fact.get("is_answer")) is bool, "布尔值 true/false"),
+                "importance": (isinstance(fact.get("importance"), str) and fact["importance"] in {"low", "medium", "high"}, "low/medium/high"),
+            }
+            for field, (valid, expected) in field_rules.items():
+                if not valid:
+                    value = repr(fact[field])[:80] if field in fact else "<缺失>"
+                    raise ValueError(f"案例事实 {fact['fact_id']}.{field} 无效：收到 {value}；要求 {expected}")
             if any(not isinstance(fact.get(k), str) or not fact[k].strip() for k in ("content", "reason")) or not isinstance(fact.get("conditions"), list):
                 raise ValueError("案例事实缺少内容、理由或条件")
             if "level_evidence" not in fact or fact["level"] is None and fact["level_evidence"] is not None:

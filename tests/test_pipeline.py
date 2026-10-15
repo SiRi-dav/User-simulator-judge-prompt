@@ -179,6 +179,15 @@ class PipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '没有获知'):
             r.validate_job_result(item, data)
 
+    def test_case_field_errors_identify_exact_field(self):
+        item = r.make_case_jobs(r.load_dialogues(self.sim), r.load_cases(self.cases), 'mock')[0]
+        data = r.parse_model_json(judge(item['prompt'])[0])
+        for field, value in [('level', '一级'), ('is_answer', 'false'), ('importance', '高'), ('importance', [])]:
+            broken = copy.deepcopy(data)
+            broken['facts'][0][field] = value
+            with self.assertRaisesRegex(ValueError, 'F1.' + field):
+                r.validate_job_result(item, broken)
+
     def test_realism_null_not_full_score(self):
         data = {'assessment_status': 'scored', 'overall_score': 5, 'checks': checks('R'), 'findings': []}
         data['checks']['R3'].update(status='insufficient_evidence', score=None)
