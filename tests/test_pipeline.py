@@ -188,6 +188,23 @@ class PipelineTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'F1.' + field):
                 r.validate_job_result(item, broken)
 
+    def test_numeric_string_levels_recover_from_saved_raw_without_api_call(self):
+        item = r.make_case_jobs(r.load_dialogues(self.sim), r.load_cases(self.cases), 'mock')[0]
+        raw, meta = judge(item['prompt'])
+        data = r.parse_model_json(raw)
+        data['facts'][0]['level'] = '1'
+        raw = '<think>已完成思考</think>\n```json\n' + json.dumps(data, ensure_ascii=False) + '\n```'
+        dest = self.out / 'results' / (item['job_id'] + '.json')
+        r.write_json(dest, {**{k: item[k] for k in ('job_id', 'kind', 'label', 'model', 'prompt_sha256')},
+                            'status': 'failed', 'error': '案例事实分级无效', 'raw_response': raw, 'api': meta,
+                            'service_sha256': r.digest(r.api_endpoint('http://mock.invalid/v1'))})
+        with patch.object(r, 'call_model') as mock, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(r.execute_jobs([item], self.out, 'http://mock.invalid/v1', '', 1, 0, False), (1, 0))
+            mock.assert_not_called()
+        saved = r.read_json(dest)
+        self.assertEqual(saved['result']['facts'][0]['level'], 1)
+        self.assertTrue(saved['recovered_from_raw_response'])
+
     def test_realism_null_not_full_score(self):
         data = {'assessment_status': 'scored', 'overall_score': 5, 'checks': checks('R'), 'findings': []}
         data['checks']['R3'].update(status='insufficient_evidence', score=None)

@@ -598,6 +598,15 @@ def parse_model_json(raw: str) -> dict[str, Any]:
     return value
 
 
+def normalize_model_result(kind: str, data: dict[str, Any]) -> dict[str, Any]:
+    """Accept unambiguous JSON number strings from the case extractor."""
+    if kind == "case_information_evidence" and isinstance(data.get("facts"), list):
+        for fact in data["facts"]:
+            if isinstance(fact, dict) and isinstance(fact.get("level"), str) and fact["level"] in {"1", "2", "3"}:
+                fact["level"] = int(fact["level"])
+    return data
+
+
 def validate_output(kind: str, data: dict[str, Any], b3_stat_ids: list[str] | None = None, has_real_reference: bool = False) -> None:
     required = {
         "case_information_evidence": ("schema_version", "case_id", "assessment_status", "facts", "limitations"),
@@ -811,7 +820,7 @@ def execute_jobs(jobs: list[dict[str, Any]], output: Path, base_url: str | None,
                         and isinstance(old.get("raw_response"), str)
                         and isinstance(old.get("api"), dict)
                         and old["api"].get("finish_reason") in {None, "stop"}):
-                    parsed = parse_model_json(old["raw_response"])
+                    parsed = normalize_model_result(item["kind"], parse_model_json(old["raw_response"]))
                     validate_job_result(item, parsed)
                     old.update(status="completed", result=parsed, recovered_from_raw_response=True)
                     old.pop("error", None)
@@ -828,7 +837,7 @@ def execute_jobs(jobs: list[dict[str, Any]], output: Path, base_url: str | None,
             raw, meta = call_model(item["prompt"], item["model"], base_url or "", api_key, timeout, retries)
             if meta.get("finish_reason") not in {None, "stop"}:
                 raise ValueError(f"模型未正常结束：finish_reason={meta['finish_reason']}")
-            parsed = parse_model_json(raw)
+            parsed = normalize_model_result(item["kind"], parse_model_json(raw))
             validate_job_result(item, parsed)
             record = {"job_id": item["job_id"], "kind": item["kind"], "label": item["label"], "model": item["model"], "prompt_sha256": item["prompt_sha256"], "status": "completed", "result": parsed, "api": meta}
             ok += 1
