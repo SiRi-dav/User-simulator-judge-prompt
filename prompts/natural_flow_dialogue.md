@@ -6,7 +6,7 @@
 
 只评 USER；ASSISTANT 仅提供上下文。不要预设对话来源。“自然流畅”在这里指交互推进合理性，不指措辞、语法、礼貌、真人感或表达风格。不评价助手质量、目标完成率或案例答案泄漏。
 
-综合 D1、D2、D3，对整段 USER 轨迹给一个 1–5 的整数总分。三个角度不分别打分；不使用或平均其他模块的 turn 分数。
+综合 D1、D2、D3，对整段 USER 轨迹给一个 1–5 的整数总分。三个角度分别给小分，并保留整体总分；不使用或平均其他模块的 turn 分数。
 
 ## 输入
 
@@ -91,6 +91,18 @@
 - not_applicable：不足两个 USER 消息及其间助手交互，score 为 null。
 - insufficient_evidence：角色、顺序或关键内容缺失，以致连可见轨迹也无法可靠判断，score 为 null。
 
+## 小指标评分与输出约束
+
+每个 checks 小项固定包含 status、score、reason、evidence。status 为 no_issue 时 score=5；issue 时为 1–4；not_applicable 或 insufficient_evidence 时为 null。reason 必须说明适用性及对应的分档依据。evidence 为原文引用数组，每项含 message_id、quote，沿用本模块编号规则；有问题必须引用对应证据，无问题可引用代表性证据，不可评时可为空。小分仅衡量该项的表现，不按其他小项重复扣分；总分继续依据整体评分标准独立判断，不平均小分。
+
+| 小项 | 5分 | 4分 | 3分 | 2分 | 1分 |
+| --- | --- | --- | --- | --- | --- |
+| D1 阶段衔接 | 阶段转换均有可理解的依据 | 局部衔接略弱，进展清楚 | 局部断裂但主线可辨 | 关键阶段断裂，需重建状态 | 多数关键阶段无法连成逻辑链 |
+| D2 历史利用 | 保留并利用已有进展 | 轻微重复但未损失进展 | 局部无依据重启，部分进展丢失 | 多次无效循环明显阻碍推进 | 持续丢弃关键历史，几乎不能推进 |
+| D3 合理收束 | 结束、暂停或继续符合当时状态 | 收束略含糊但关键状态一致 | 局部过早结束或无依据继续 | 基于不成立的完成状态收束，或明显应停仍重启 | 收束决定与核心状态根本冲突，严重破坏整段轨迹 |
+
+未触发该项检查条件为 not_applicable；应当检查但缺少材料为 insufficient_evidence。不得以没有确认问题代替证据充分。D3 缺少可观察的收束或继续决定时必须证据不足。所有 issue 小项须在 issues（自然流畅）或 findings（表达真实性）的 criteria 中出现，反之亦然。同一问题可关联多个小项，仍只建一条问题记录。
+
 ## 输出
 
 只输出一个合法 JSON 对象，无 Markdown 围栏和额外文字。保留所有字段。格式示意：
@@ -100,9 +112,9 @@
   "level": "dialogue",
   "assessment_status": "scored",
   "checks": {
-    "D1": {"status": "no_issue", "reason": "概括主要阶段之间的联系"},
-    "D2": {"status": "no_issue", "reason": "说明用户如何承接已有进展"},
-    "D3": {"status": "insufficient_evidence", "reason": "可见记录中没有用户收束决定，无法判断结束时机"}
+    "D1": {"status": "no_issue", "score": 5, "evidence": [], "reason": "概括主要阶段之间的联系"},
+    "D2": {"status": "no_issue", "score": 5, "evidence": [], "reason": "说明用户如何承接已有进展"},
+    "D3": {"status": "insufficient_evidence", "score": null, "evidence": [], "reason": "可见记录中没有用户收束决定，无法判断结束时机"}
   },
   "issues": [],
   "summary": "概括可见轨迹及其与评分标准的对应关系",

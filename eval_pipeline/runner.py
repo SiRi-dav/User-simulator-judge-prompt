@@ -1,4 +1,4 @@
-"""Run the repository's six judge prompts over local conversations.
+"""Run the repository's judge prompts over local conversations.
 
 Python standard library only. Invoke with: python3 -m eval_pipeline.runner --help
 """
@@ -23,6 +23,7 @@ from urllib import error, request
 
 ROOT = Path(__file__).resolve().parent.parent
 PROMPT_PATHS = {
+    "case_information_evidence": ROOT / "prompts/case_information_evidence.md",
     "natural_flow_turn": ROOT / "prompts/natural_flow_turn.md",
     "natural_flow_dialogue": ROOT / "prompts/natural_flow_dialogue.md",
     "information_leakage_dialogue": ROOT / "prompts/information_leakage_dialogue.md",
@@ -31,9 +32,10 @@ PROMPT_PATHS = {
     "expression_realism_batch": ROOT / "prompts/expression_realism_batch.md",
 }
 PLACEHOLDERS = {
+    "case_information_evidence": ["{{CASE_TEXT}}"],
     "natural_flow_turn": ["{{DIALOGUE_TEXT}}"],
     "natural_flow_dialogue": ["{{DIALOGUE_TEXT}}"],
-    "information_leakage_dialogue": ["{{CASE_TEXT}}", "{{DIALOGUE}}"],
+    "information_leakage_dialogue": ["{{CASE_TEXT}}", "{{CASE_EVIDENCE}}", "{{DIALOGUE}}"],
     "expression_realism_dialogue": ["{{INPUT_MARKDOWN}}"],
     "expression_feature_annotation": ["{{INPUT_MARKDOWN}}"],
     "expression_realism_batch": ["{{INPUT_MARKDOWN}}"],
@@ -454,7 +456,7 @@ def job(kind: str, label: str, replacements: dict[str, str], model: str) -> dict
     return {"job_id": identity[:24], "kind": kind, "label": label, "model": model, "prompt_sha256": digest(prompt), "prompt": prompt}
 
 
-def make_core_jobs(dialogues: list[Dialogue], cases: dict[str, dict[str, Any]], model: str) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+def make_core_jobs(dialogues: list[Dialogue], cases: dict[str, dict[str, Any]], model: str, evidence: dict[str, dict[str, Any]] | None = None) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     jobs, skipped = [], []
     for d in dialogues:
         full = render_dialogue(d, include_outcome=False)
@@ -466,13 +468,101 @@ def make_core_jobs(dialogues: list[Dialogue], cases: dict[str, dict[str, Any]], 
                 jobs.append(job("natural_flow_turn", f"{d.dialogue_id}__m{i}", {"{{DIALOGUE_TEXT}}": prefix}, model))
         case = cases.get(d.case_id)
         if case and case.get("text") and any(str(x).strip() for x in case["text"]):
-            payload = {d.case_id: {"case_name": case["case_name"], "text": case["text"]}}
-            if case.get("source_note"):
-                payload[d.case_id]["source_note"] = case["source_note"]
-            jobs.append(job("information_leakage_dialogue", d.dialogue_id, {"{{CASE_TEXT}}": json.dumps(payload, ensure_ascii=False), "{{DIALOGUE}}": full}, model))
+            if evidence is None:
+                continue  # Leakage requests are built only after the evidence dependency succeeds.
+            if d.case_id not in evidence:
+                skipped.append({"kind": "information_leakage_dialogue", "dialogue_id": d.dialogue_id, "reason": "案例核验依据失败或完全不足，未运行泄漏评测"})
+                continue
+            payload = case_payload(d.case_id, case)
+            item = job("information_leakage_dialogue", d.dialogue_id, {"{{CASE_TEXT}}": json.dumps(payload, ensure_ascii=False), "{{CASE_EVIDENCE}}": json.dumps(evidence[d.case_id], ensure_ascii=False, sort_keys=True), "{{DIALOGUE}}": full}, model)
+            item["_case_evidence"] = evidence[d.case_id]
+            item["_case_source"] = payload[d.case_id]
+            jobs.append(item)
         else:
             skipped.append({"kind": "information_leakage_dialogue", "dialogue_id": d.dialogue_id, "reason": "缺少匹配案例或案例正文为空"})
     return jobs, skipped
+
+
+def case_payload(case_id: str, case: dict[str, Any]) -> dict[str, Any]:
+    body = {"case_name": case["case_name"], "text": case["text"]}
+    if case.get("source_note"):
+        body["source_note"] = case["source_note"]
+    return {case_id: body}
+
+
+def make_case_jobs(dialogues: list[Dialogue], cases: dict[str, dict[str, Any]], model: str) -> list[dict[str, Any]]:
+    jobs = []
+    for case_id in sorted({d.case_id for d in dialogues}):
+        case = cases.get(case_id)
+        if not case or not case.get("text") or not any(str(x).strip() for x in case["text"]):
+            continue
+        payload = case_payload(case_id, case)
+        item = job("case_information_evidence", case_id, {"{{CASE_TEXT}}": json.dumps(payload, ensure_ascii=False, sort_keys=True)}, model)
+        item["_case_source"] = payload[case_id]
+        jobs.append(item)
+    return jobs
+
+
+def validate_source(source: Any, case: dict[str, Any]) -> None:
+    if not isinstance(source, dict) or not isinstance(source.get("quote"), str) or not source["quote"].strip():
+        raise ValueError("案例依据缺少原文引用")
+    location = source.get("location", "")
+    match = re.fullmatch(r"text\[(\d+)\]", location) if isinstance(location, str) else None
+    original = case.get("case_name", "") if location == "case_name" else ""
+    if match and int(match[1]) < len(case["text"]):
+        original = case["text"][int(match[1])]
+    if source["quote"] not in original:
+        raise ValueError("案例依据引用不属于指定原文位置")
+
+
+def validate_checks(kind: str, data: dict[str, Any]) -> None:
+    prefix = {"natural_flow_turn": "T", "natural_flow_dialogue": "D", "expression_realism_dialogue": "R", "information_leakage_dialogue": "L"}[kind]
+    keys = {prefix + str(i) for i in range(1, 5 if prefix == "L" else 4)}
+    checks = data.get("checks")
+    if not isinstance(checks, dict) or set(checks) != keys:
+        raise ValueError("checks 必须完整包含本模块小指标")
+    for key, check in checks.items():
+        if not isinstance(check, dict) or check.get("status") not in {"no_issue", "issue", "not_applicable", "insufficient_evidence"} or not isinstance(check.get("reason"), str) or not check["reason"].strip() or "score" not in check:
+            raise ValueError(f"{key} 缺少状态、分数或理由")
+        status, score = check["status"], check["score"]
+        if status == "no_issue" and (type(score) is not int or score != 5) or status == "issue" and (type(score) is not int or not 1 <= score <= 4) or status in {"not_applicable", "insufficient_evidence"} and score is not None:
+            raise ValueError(f"{key} 小分与状态不符")
+        if prefix != "L":
+            evidence = check.get("evidence")
+            if not isinstance(evidence, list) or status == "issue" and not evidence:
+                raise ValueError(f"{key} 缺少证据数组")
+            if any(not isinstance(e, dict) or not isinstance(e.get("message_id"), str) or not isinstance(e.get("quote"), str) or not e["quote"].strip() for e in evidence):
+                raise ValueError(f"{key} 原文证据格式无效")
+    declared = {k for k, c in checks.items() if c["status"] == "issue"}
+    if prefix == "L":
+        events = data["violations"]
+        ids = [e.get("event_id") for e in events]
+        if any(not isinstance(e, str) or not e for e in ids) or len(set(ids)) != len(ids):
+            raise ValueError("泄漏事件编号必须唯一")
+        if any(e.get("category") not in keys for e in events):
+            raise ValueError("泄漏事件 category 无效")
+        cited = {e["category"] for e in events}
+        for key, check in checks.items():
+            expected = [e["event_id"] for e in events if e["category"] == key]
+            refs = check.get("event_ids")
+            if not isinstance(refs, list) or any(not isinstance(x, str) for x in refs) or sorted(refs) != sorted(expected):
+                raise ValueError(f"{key} 引用事件与入口不一致")
+            if expected and check["score"] != max(1, 5 - sum(e["deduction"] for e in events if e["category"] == key)):
+                raise ValueError(f"{key} 小分与事件扣分不一致")
+        if data["assessment_status"] == "assessed" and any(c["status"] == "insufficient_evidence" for c in checks.values()):
+            raise ValueError("存在未核验入口时泄漏总体必须为 partial 或 insufficient_evidence")
+    else:
+        findings = data["findings" if prefix == "R" else "issues"]
+        cited = set()
+        for finding in findings:
+            if not isinstance(finding, dict) or not isinstance(finding.get("criteria"), list) or not finding["criteria"] or any(c not in keys for c in finding["criteria"]):
+                raise ValueError("问题记录缺少有效 criteria")
+            cited.update(finding["criteria"])
+    if declared != cited:
+        raise ValueError("小项 issue 与确认事件不一致")
+    assessable = any(c["status"] in {"no_issue", "issue"} for c in checks.values())
+    if assessable != (data["assessment_status"] in {"scored", "assessed", "partial"}):
+        raise ValueError("小项可评性与总体状态不一致")
 
 
 def group_chunks(items: list[Dialogue], count: int) -> list[list[Dialogue]]:
@@ -510,6 +600,7 @@ def parse_model_json(raw: str) -> dict[str, Any]:
 
 def validate_output(kind: str, data: dict[str, Any], b3_stat_ids: list[str] | None = None, has_real_reference: bool = False) -> None:
     required = {
+        "case_information_evidence": ("schema_version", "case_id", "assessment_status", "facts", "limitations"),
         "natural_flow_turn": ("assessment_status", "score", "checks"),
         "natural_flow_dialogue": ("assessment_status", "score", "checks"),
         "information_leakage_dialogue": ("assessment_status", "score", "violations"),
@@ -520,6 +611,26 @@ def validate_output(kind: str, data: dict[str, Any], b3_stat_ids: list[str] | No
     missing = [k for k in required if k not in data]
     if missing:
         raise ValueError(f"模型输出缺少字段：{','.join(missing)}")
+    if kind == "case_information_evidence":
+        if data["schema_version"] != "case_evidence_v1" or data["assessment_status"] not in {"ready", "partial", "insufficient_evidence"} or not isinstance(data["facts"], list) or not isinstance(data["limitations"], list):
+            raise ValueError("案例核验依据结构无效")
+        if bool(data["facts"]) != (data["assessment_status"] != "insufficient_evidence"):
+            raise ValueError("案例核验依据状态与事实数量不符")
+        ids = set()
+        for fact in data["facts"]:
+            if not isinstance(fact, dict) or not isinstance(fact.get("fact_id"), str) or not re.fullmatch(r"F[1-9][0-9]*", fact["fact_id"]) or fact["fact_id"] in ids:
+                raise ValueError("案例事实编号无效或重复")
+            ids.add(fact["fact_id"])
+            if "level" not in fact or fact["level"] is not None and (type(fact["level"]) is not int or fact["level"] not in {1, 2, 3}) or type(fact.get("is_answer")) is not bool or fact.get("importance") not in {"low", "medium", "high"}:
+                raise ValueError("案例事实分级无效")
+            if any(not isinstance(fact.get(k), str) or not fact[k].strip() for k in ("content", "reason")) or not isinstance(fact.get("conditions"), list):
+                raise ValueError("案例事实缺少内容、理由或条件")
+            if "level_evidence" not in fact or fact["level"] is None and fact["level_evidence"] is not None:
+                raise ValueError("未知等级的依据必须为 null")
+            for condition in fact["conditions"]:
+                if not isinstance(condition, dict) or condition.get("type") not in {"acquisition", "disclosure"} or not isinstance(condition.get("description"), str) or not condition["description"].strip():
+                    raise ValueError("案例条件结构无效")
+        return
     statuses = {
         "natural_flow_turn": {"scored", "not_applicable", "insufficient_evidence"},
         "natural_flow_dialogue": {"scored", "not_applicable", "insufficient_evidence"},
@@ -574,6 +685,7 @@ def validate_output(kind: str, data: dict[str, Any], b3_stat_ids: list[str] | No
                 deductions.append(deduction)
             if score != max(1, 5 - sum(deductions)):
                 raise ValueError("信息泄漏 score 与事件扣分总和不一致")
+        validate_checks(kind, data)
     elif kind == "expression_feature_annotation":
         if data["schema_version"] != "expression_features_v1" or not isinstance(data["dialogues"], list) or not isinstance(data["excluded_dialogues"], list):
             raise ValueError("表达特征标注的结构或版本无效")
@@ -643,6 +755,23 @@ def call_model(prompt: str, model: str, base_url: str, api_key: str, timeout: fl
 
 def validate_job_result(item: dict[str, Any], data: dict[str, Any]) -> None:
     validate_output(item["kind"], data, item.get("b3_stat_ids"), item.get("has_real_reference", False))
+    if item["kind"] == "case_information_evidence":
+        if data["case_id"] != item["label"]:
+            raise ValueError("案例依据 case_id 与输入不一致")
+        for fact in data["facts"]:
+            validate_source(fact.get("source"), item["_case_source"])
+            if fact["level"] is not None:
+                validate_source(fact.get("level_evidence"), item["_case_source"])
+            for condition in fact["conditions"]:
+                validate_source(condition.get("source"), item["_case_source"])
+    if item["kind"] == "information_leakage_dialogue":
+        facts = {f["fact_id"]: f for f in item["_case_evidence"]["facts"]}
+        for event in data["violations"]:
+            refs = event.get("fact_ids")
+            if not isinstance(refs, list) or not refs or any(not isinstance(r, str) or r not in facts for r in refs):
+                raise ValueError("泄漏事件缺少有效案例事实编号")
+            if not any(facts[r]["conditions"] for r in refs):
+                raise ValueError("泄漏事件引用的案例事实没有获知/披露条件")
     if item["kind"] == "expression_feature_annotation":
         if data["excluded_dialogues"]:
             raise ValueError("标注排除了输入会话，需修复后再生成统计")
@@ -1034,6 +1163,13 @@ def summarize(output: Path, jobs: list[dict[str, Any]], skipped: list[dict[str, 
         result = read_json(path) if path.exists() and not preview else {}
         body = result.get("result", {})
         rows.append({"kind": item["kind"], "label": item["label"], "job_id": item["job_id"], "run_status": result.get("status", "not_run"), "assessment_status": body.get("assessment_status", ""), "score": body.get("score", body.get("overall_score", "")), "B1": body.get("B1", {}).get("status", ""), "B2": body.get("B2", {}).get("status", ""), "B3": body.get("B3", {}).get("status", ""), "checks": json.dumps(body.get("checks", {}), ensure_ascii=False), "summary": body.get("summary", ""), "limitations": json.dumps(body.get("limitations", []), ensure_ascii=False), "error": result.get("error", "")})
+        for prefix, count in (("T", 3), ("D", 3), ("R", 3), ("L", 4)):
+            for i in range(1, count + 1):
+                key = f"{prefix}{i}"
+                check = body.get("checks", {}).get(key, {})
+                rows[-1][key + "_score"] = check.get("score")
+                rows[-1][key + "_status"] = check.get("status", "")
+                rows[-1][key + "_reason"] = check.get("reason", "")
     counts = Counter(f"{x['kind']}:{x['run_status']}" for x in rows)
     summary = {"job_count": len(rows), "status_counts": dict(sorted(counts.items())), "skipped": skipped, "note": "各入口分数不相加；batch 三项是诊断状态，不是分数。未运行与失败不等于0分。"}
     summary["assessment_counts"] = dict(Counter(f"{r['kind']}:{r['assessment_status']}" for r in rows if r["assessment_status"]))
@@ -1131,14 +1267,15 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("真人与模拟对话存在重复 dialogue_id，请先分别改为唯一编号")
         output.mkdir(parents=True, exist_ok=True)
         # Aggregates describe this run only. Keep per-job caches for resume.
-        for name in ("summary.json", "results.csv", "annotations_simulated.json", "annotations_real.json", "feature_statistics.json", "feature_statistics.csv", "comparison_coverage.json"):
+        for name in ("summary.json", "results.csv", "annotations_simulated.json", "annotations_real.json", "feature_statistics.json", "feature_statistics.csv", "comparison_coverage.json", "case_evidence_index.json"):
             (output / name).unlink(missing_ok=True)
         api_key = os.environ.get(args.api_key_env) or config.get("api_key", "")
         core, skipped = make_core_jobs(dialogues, cases, args.model)
         manifest_base = {"dialogue_count": len(dialogues), "total_dialogue_count": len(all_dialogues), "case_count": len(cases), "real_dialogue_count": len(real), "real_reference_selection": {**real_audit, "case_ids": sorted(wanted_cases)}, "selection": selection}
         sim_ann = make_annotation_jobs(dialogues, args.model, args.annotation_batch_size, "sim") if real else []
         real_ann = make_annotation_jobs(real, args.model, args.annotation_batch_size, "real")
-        jobs = core + sim_ann + real_ann
+        case_jobs = make_case_jobs(dialogues, cases, args.model)
+        jobs = case_jobs + core + sim_ann + real_ann
         requests_dir = output / "requests"
         requests_dir.mkdir(exist_ok=True)
         for item in jobs:
@@ -1150,11 +1287,34 @@ def main(argv: list[str] | None = None) -> int:
             jobs += preview
             for item in preview:
                 (requests_dir / f"{item['job_id']}.txt").write_text(item["prompt"], encoding="utf-8")
-            write_json(output / "manifest.json", {**manifest_base, "jobs": [{k: v for k, v in j.items() if k != "prompt" and not k.startswith("_")} for j in jobs], "skipped": skipped, "note": "Batch任务为预览；真人统计在标注完成后生成，实际 Batch 请求ID会变化"})
+            write_json(output / "manifest.json", {**manifest_base, "jobs": [{k: v for k, v in j.items() if k != "prompt" and not k.startswith("_")} for j in jobs], "skipped": skipped, "pending_leakage": [d.dialogue_id for d in dialogues if d.case_id in {j["label"] for j in case_jobs}], "note": "泄漏任务等待案例依据成功后生成；Batch任务为预览，真人统计完成后请求ID会变化"})
             summarize(output, jobs, skipped, preview=True, selection=selection)
             print(f"准备完成：{len(jobs)} 个任务，{len(skipped)} 个跳过；没有调用模型。结果：{output}")
             return 0
+        # Shared across slices, versioned by case text, prompt, model and service.
+        case_cache = output_root / "case_evidence" / digest(api_endpoint(args.base_url))[:16]
+        case_ok, case_failed = execute_jobs(case_jobs, case_cache, args.base_url, api_key, args.timeout, args.retries, False, args.force)
+        evidence = {}
+        evidence_files = {}
+        for item in case_jobs:
+            path = case_cache / "results" / (item["job_id"] + ".json")
+            record = read_json(path)
+            write_json(output / "results" / path.name, record)
+            evidence_files[item["label"]] = {"path": str(path), "job_id": item["job_id"], "status": record["status"]}
+            if record["status"] == "completed":
+                validate_job_result(item, record["result"])
+                if record["result"]["assessment_status"] != "insufficient_evidence":
+                    evidence[item["label"]] = record["result"]
+        write_json(output / "case_evidence_index.json", evidence_files)
+        core, skipped = make_core_jobs(dialogues, cases, args.model, evidence)
+        jobs = case_jobs + core + sim_ann + real_ann
+        for item in core:
+            (requests_dir / f"{item['job_id']}.txt").write_text(item["prompt"], encoding="utf-8")
+        write_json(output / "manifest.json", {**manifest_base, "case_evidence": evidence_files, "jobs": [{k: v for k, v in j.items() if k != "prompt" and not k.startswith("_")} for j in jobs], "skipped": skipped})
+        manifest_base["case_evidence"] = evidence_files
         ok, failed = execute_jobs(core + sim_ann + real_ann, output, args.base_url, api_key, args.timeout, args.retries, False, args.force)
+        ok += case_ok
+        failed += case_failed
         stats_by_batch = {}
         coverage_by_batch = {}
         if real:

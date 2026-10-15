@@ -6,7 +6,7 @@
 
 只评价输入正文的最后一条 USER 消息，其前面的消息仅作上下文。不要预设对话来源。这里的“自然流畅”是交互动作的承接与推进合理性，不是措辞、语法、礼貌、口语化、真人感、专业程度或任务完成率。不评价助手质量，也不判断案例答案是否泄漏。
 
-综合 T1、T2、T3，给目标 USER 回复一个 1–5 的整数总分。三个角度只作诊断，不分别打分，不按问题标签个数扣分。
+综合 T1、T2、T3，给目标 USER 回复一个 1–5 的整数总分。三个角度分别给小分，并保留整体总分；不按问题标签个数扣分。
 
 ## 输入
 
@@ -92,6 +92,18 @@
 - not_applicable：没有前置助手的开场 USER；score 为 null。
 - insufficient_evidence：输入损坏、目标不明或关键上下文缺失，以致连本轮基本承接也无法判断；score 为 null。
 
+## 小指标评分与输出约束
+
+每个 checks 小项固定包含 status、score、reason、evidence。status 为 no_issue 时 score=5；issue 时为 1–4；not_applicable 或 insufficient_evidence 时为 null。reason 必须说明适用性及对应的分档依据。evidence 为原文引用数组，每项含 message_id、quote，沿用本模块编号规则；有问题必须引用对应证据，无问题可引用代表性证据，不可评时可为空。小分仅衡量该项的表现，不按其他小项重复扣分；总分继续依据整体评分标准独立判断，不平均小分。
+
+| 小项 | 5分 | 4分 | 3分 | 2分 | 1分 |
+| --- | --- | --- | --- | --- | --- |
+| T1 回应承接 | 直接回应或合理转向 | 轻微偏离但主要意图清楚 | 关键回应需澄清 | 主要回应脱离当前请求 | 几乎无法建立回应关系 |
+| T2 必要前提 | 进展与前提一致 | 轻微步骤表述遗漏且状态清楚 | 局部关键前提跳过，需纠正 | 核心完成声明缺乏必要前提 | 核心操作状态根本冲突，无法继续 |
+| T3 新信息调整 | 合理吸收或有依据地质疑新信息 | 轻微理解偏差不影响主要选择 | 误用局部新信息，需澄清 | 关键行动基于已被否定的理解 | 整体行动与明确新信息根本不相容 |
+
+未触发该项检查条件为 not_applicable；应当检查但缺少材料为 insufficient_evidence。不得以没有确认问题代替证据充分。所有 issue 小项须在 issues（自然流畅）或 findings（表达真实性）的 criteria 中出现，反之亦然。同一问题可关联多个小项，仍只建一条问题记录。
+
 ## 输出
 
 只输出一个合法 JSON 对象，无 Markdown 围栏和额外文字。保留所有字段。格式示意：
@@ -102,9 +114,9 @@
   "target_user_id": "m3",
   "assessment_status": "scored",
   "checks": {
-    "T1": {"status": "no_issue", "reason": "说明当前回应与助手消息的联系"},
-    "T2": {"status": "no_issue", "reason": "说明所报告进展与必要前提的关系"},
-    "T3": {"status": "not_applicable", "reason": "本轮无影响后续选择的新信息"}
+    "T1": {"status": "no_issue", "score": 5, "evidence": [], "reason": "说明当前回应与助手消息的联系"},
+    "T2": {"status": "no_issue", "score": 5, "evidence": [], "reason": "说明所报告进展与必要前提的关系"},
+    "T3": {"status": "not_applicable", "score": null, "evidence": [], "reason": "本轮无影响后续选择的新信息"}
   },
   "issues": [],
   "summary": "概括当前回复的表现及其与评分标准的对应关系",
