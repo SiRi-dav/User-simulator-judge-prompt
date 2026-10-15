@@ -205,6 +205,51 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(saved['result']['facts'][0]['level'], 1)
         self.assertTrue(saved['recovered_from_raw_response'])
 
+    def test_unambiguous_formats_recover_across_other_modules(self):
+        dialogues, cases = r.load_dialogues(self.sim), r.load_cases(self.cases)
+        core, _ = r.make_core_jobs(dialogues[:1], cases, 'mock')
+        turn = next(j for j in core if j['kind'] == 'natural_flow_turn')
+        realism = next(j for j in core if j['kind'] == 'expression_realism_dialogue')
+        ann = r.make_annotation_jobs(dialogues[:1], 'mock', 1, 'sim')[0]
+        records = []
+        for item in (turn, realism, ann):
+            data = r.parse_model_json(judge(item['prompt'])[0])
+            if item is turn:
+                data['score'] = '5'
+                data['checks']['T1']['score'] = '5'
+            elif item is realism:
+                data['overall_score'] = '5'
+                data['checks']['R1']['score'] = '5'
+            else:
+                first = data['dialogues'][0]['messages'][0]
+                first['context']['detail_requested'] = 'false'
+                first['context']['tasks'] = '描述问题'
+                first['context']['assistant_feedback'] = '无反馈'
+                first['features']['emotion'] = '无明显情绪'
+                first['features']['formality'] = ['中性']
+            dest = self.out / 'results' / (item['job_id'] + '.json')
+            r.write_json(dest, {**{k: item[k] for k in ('job_id', 'kind', 'label', 'model', 'prompt_sha256')},
+                                'status': 'failed', 'raw_response': '<think>done</think>\n' + json.dumps(data, ensure_ascii=False),
+                                'api': {'finish_reason': 'stop'},
+                                'service_sha256': r.digest(r.api_endpoint('http://mock.invalid/v1'))})
+            records.append((item, dest))
+        with patch.object(r, 'call_model') as mock, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(r.execute_jobs([item for item, _ in records], self.out,
+                                            'http://mock.invalid/v1', '', 1, 0, False), (3, 0))
+            mock.assert_not_called()
+        for _, dest in records:
+            self.assertTrue(r.read_json(dest)['recovered_from_raw_response'])
+
+    def test_unknown_label_is_not_silently_converted(self):
+        data = {'schema_version': 'case_evidence_v1', 'case_id': 'CASE1', 'assessment_status': 'ready',
+                'facts': [{'fact_id': 'F1', 'content': 'x', 'source': {'location': 'text[0]', 'quote': 'x'},
+                           'level': '大概一级', 'level_evidence': None, 'is_answer': 'maybe',
+                           'importance': '大概高', 'conditions': [], 'reason': 'x'}], 'limitations': []}
+        normalized = r.normalize_model_result('case_information_evidence', data)
+        self.assertEqual(normalized['facts'][0]['level'], '大概一级')
+        with self.assertRaisesRegex(ValueError, 'F1.level'):
+            r.validate_output('case_information_evidence', normalized)
+
     def test_realism_null_not_full_score(self):
         data = {'assessment_status': 'scored', 'overall_score': 5, 'checks': checks('R'), 'findings': []}
         data['checks']['R3'].update(status='insufficient_evidence', score=None)

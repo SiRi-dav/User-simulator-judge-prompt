@@ -599,11 +599,56 @@ def parse_model_json(raw: str) -> dict[str, Any]:
 
 
 def normalize_model_result(kind: str, data: dict[str, Any]) -> dict[str, Any]:
-    """Accept unambiguous JSON number strings from the case extractor."""
+    """Normalize only model formats with a single, unambiguous meaning."""
+    def bounded_integer(value: Any, allowed: set[int]) -> Any:
+        return int(value) if isinstance(value, str) and value in {str(x) for x in allowed} else value
+
     if kind == "case_information_evidence" and isinstance(data.get("facts"), list):
         for fact in data["facts"]:
-            if isinstance(fact, dict) and isinstance(fact.get("level"), str) and fact["level"] in {"1", "2", "3"}:
-                fact["level"] = int(fact["level"])
+            if not isinstance(fact, dict):
+                continue
+            if "level" in fact:
+                fact["level"] = bounded_integer(fact["level"], {1, 2, 3})
+            if isinstance(fact.get("is_answer"), str) and fact["is_answer"].lower() in {"true", "false"}:
+                fact["is_answer"] = fact["is_answer"].lower() == "true"
+            if isinstance(fact.get("importance"), str) and fact["importance"] in {"高", "中", "低"}:
+                fact["importance"] = {"高": "high", "中": "medium", "低": "low"}[fact["importance"]]
+    elif kind in {"natural_flow_turn", "natural_flow_dialogue", "information_leakage_dialogue", "expression_realism_dialogue"}:
+        score_key = "overall_score" if kind == "expression_realism_dialogue" else "score"
+        if score_key in data:
+            data[score_key] = bounded_integer(data[score_key], {1, 2, 3, 4, 5})
+        if isinstance(data.get("checks"), dict):
+            for check in data["checks"].values():
+                if isinstance(check, dict) and "score" in check:
+                    check["score"] = bounded_integer(check["score"], {1, 2, 3, 4, 5})
+        if kind == "information_leakage_dialogue" and isinstance(data.get("violations"), list):
+            for violation in data["violations"]:
+                if isinstance(violation, dict) and "deduction" in violation:
+                    violation["deduction"] = bounded_integer(violation["deduction"], {1, 2, 4})
+    elif kind == "expression_feature_annotation" and isinstance(data.get("dialogues"), list):
+        for dialogue in data["dialogues"]:
+            if not isinstance(dialogue, dict) or not isinstance(dialogue.get("messages"), list):
+                continue
+            for message in dialogue["messages"]:
+                if not isinstance(message, dict):
+                    continue
+                context = message.get("context")
+                if isinstance(context, dict):
+                    for key in ("detail_requested", "format_requested", "has_quoted_material"):
+                        value = context.get(key)
+                        if isinstance(value, str) and value.lower() in {"true", "false"}:
+                            context[key] = value.lower() == "true"
+                    for key, allowed in (("tasks", TASK_LABELS), ("assistant_feedback", FEEDBACK_LABELS)):
+                        if isinstance(context.get(key), str) and context[key] in allowed:
+                            context[key] = [context[key]]
+                features = message.get("features")
+                if isinstance(features, dict):
+                    for key in ("emotion", "politeness", "restatement"):
+                        if isinstance(features.get(key), str) and features[key] in FEATURE_LABELS[key]:
+                            features[key] = [features[key]]
+                    for key in ("formality", "organization"):
+                        if isinstance(features.get(key), list) and len(features[key]) == 1 and isinstance(features[key][0], str) and features[key][0] in FEATURE_LABELS[key]:
+                            features[key] = features[key][0]
     return data
 
 
@@ -848,7 +893,8 @@ def execute_jobs(jobs: list[dict[str, Any]], output: Path, base_url: str | None,
             record["api"] = meta
         record["service_sha256"] = service_sha256
         write_json(dest, record)
-        print(f"[{n}/{len(jobs)}] {item['kind']} {item['label']}: {record['status']}", flush=True)
+        detail = f"；原因：{record['error'][:240]}" if record["status"] == "failed" else ""
+        print(f"[{n}/{len(jobs)}] {item['kind']} {item['label']}: {record['status']}{detail}", flush=True)
     return ok, failed
 
 
