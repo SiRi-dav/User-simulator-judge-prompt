@@ -13,6 +13,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -503,6 +504,16 @@ def make_case_jobs(dialogues: list[Dialogue], cases: dict[str, dict[str, Any]], 
     return jobs
 
 
+def compact_with_positions(value: str) -> tuple[str, list[int]]:
+    compact, positions = [], []
+    for index, char in enumerate(value):
+        for normalized in unicodedata.normalize("NFKC", char).casefold():
+            if normalized.isalnum():
+                compact.append(normalized)
+                positions.append(index)
+    return "".join(compact), positions
+
+
 def validate_source(source: Any, case: dict[str, Any]) -> None:
     if not isinstance(source, dict) or not isinstance(source.get("quote"), str) or not source["quote"].strip():
         raise ValueError("案例依据缺少原文引用")
@@ -519,7 +530,26 @@ def validate_source(source: Any, case: dict[str, Any]) -> None:
     if len(matches) == 1:
         source["location"] = matches[0]
         return
-    reason = "案例原文中找不到该引文" if not matches else "引文出现在多个原文位置，无法确定来源"
+    if matches:
+        raise ValueError(f"案例依据引用位置 {location!r} 无效：引文出现在多个原文位置，无法确定来源")
+    needle, _ = compact_with_positions(source["quote"])
+    approximate = []
+    # Short technical values can change meaning when punctuation is removed.
+    if len(needle) >= 8:
+        for place, value in locations:
+            if not isinstance(value, str):
+                continue
+            compact, positions = compact_with_positions(value)
+            start = compact.find(needle)
+            while start >= 0:
+                approximate.append((place, value[positions[start]:positions[start + len(needle) - 1] + 1]))
+                start = compact.find(needle, start + 1)
+        preferred = [item for item in approximate if item[0] == location]
+        selected = preferred if len(preferred) == 1 else approximate
+        if len(selected) == 1:
+            source["location"], source["quote"] = selected[0]
+            return
+    reason = "案例原文中找不到可核对的引文" if not approximate else "引文出现在多个原文位置，无法确定来源"
     raise ValueError(f"案例依据引用位置 {location!r} 无效：{reason}")
 
 
@@ -823,26 +853,66 @@ def call_model(prompt: str, model: str, base_url: str, api_key: str, timeout: fl
 
 
 def validate_job_result(item: dict[str, Any], data: dict[str, Any]) -> None:
+    if (item["kind"] == "information_leakage_dialogue"
+            and item["_case_evidence"]["assessment_status"] == "partial"
+            and data.get("assessment_status") == "assessed"):
+        data["assessment_status"] = "partial"
+        if isinstance(data.get("limitations"), list):
+            note = "案例核验依据仅部分可用；总分只覆盖已核实事实"
+            if note not in data["limitations"]:
+                data["limitations"].append(note)
     validate_output(item["kind"], data, item.get("b3_stat_ids"), item.get("has_real_reference", False))
     if item["kind"] == "case_information_evidence":
         if data["case_id"] != item["label"]:
             raise ValueError("案例依据 case_id 与输入不一致")
-        corrections = []
+        corrections, retained, excluded = [], [], []
+        evidence_reduced = False
+
+        def verify_source(fact_id: str, field: str, source: Any) -> str | None:
+            previous_location = source.get("location") if isinstance(source, dict) else None
+            previous_quote = source.get("quote") if isinstance(source, dict) else None
+            try:
+                validate_source(source, item["_case_source"])
+            except ValueError as exc:
+                return f"案例事实 {fact_id}.{field}：{exc}"
+            if source["location"] != previous_location or source["quote"] != previous_quote:
+                corrections.append({"fact_id": fact_id, "field": field,
+                                    "from": previous_location, "to": source["location"],
+                                    "from_quote": previous_quote, "to_quote": source["quote"]})
+            return None
+
         for fact in data["facts"]:
-            sources = [("source", fact.get("source"))]
+            fact_id = fact["fact_id"]
+            problem = verify_source(fact_id, "source", fact.get("source"))
+            if problem:
+                excluded.append({"fact_id": fact_id, "reason": problem})
+                continue
             if fact["level"] is not None:
-                sources.append(("level_evidence", fact.get("level_evidence")))
-            sources += [(f"conditions[{i}].source", condition.get("source")) for i, condition in enumerate(fact["conditions"])]
-            for field, source in sources:
-                previous = source.get("location") if isinstance(source, dict) else None
-                try:
-                    validate_source(source, item["_case_source"])
-                except ValueError as exc:
-                    raise ValueError(f"案例事实 {fact['fact_id']}.{field}：{exc}") from exc
-                if source["location"] != previous:
-                    corrections.append({"fact_id": fact["fact_id"], "field": field, "from": previous, "to": source["location"]})
+                problem = verify_source(fact_id, "level_evidence", fact.get("level_evidence"))
+                if problem:
+                    fact["level"], fact["level_evidence"] = None, None
+                    data["limitations"].append(problem + "；知识等级已改为未知")
+                    evidence_reduced = True
+            valid_conditions = []
+            for index, condition in enumerate(fact["conditions"]):
+                problem = verify_source(fact_id, f"conditions[{index}].source", condition.get("source"))
+                if problem:
+                    data["limitations"].append(problem + "；该条件未用于评测")
+                    evidence_reduced = True
+                else:
+                    valid_conditions.append(condition)
+            fact["conditions"] = valid_conditions
+            retained.append(fact)
+        if excluded:
+            evidence_reduced = True
+            data["excluded_facts"] = excluded
+            data["limitations"].extend(x["reason"] + "；该事实未用于评测" for x in excluded)
+        data["facts"] = retained
+        if evidence_reduced:
+            data["assessment_status"] = "partial" if retained else "insufficient_evidence"
         if corrections:
             data["source_location_corrections"] = corrections
+        validate_output(item["kind"], data)
     if item["kind"] == "information_leakage_dialogue":
         facts = {f["fact_id"]: f for f in item["_case_evidence"]["facts"]}
         for event in data["violations"]:

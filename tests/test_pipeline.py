@@ -120,7 +120,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(self.run_main(), 0)
             self.assertEqual(count(), 2)
 
-    def test_bad_case_evidence_blocks_leakage_only(self):
+    def test_unverifiable_only_fact_blocks_leakage_only(self):
         def bad(prompt, *args):
             raw, meta = judge(prompt, *args)
             if prompt.startswith('# 案例信息'):
@@ -129,10 +129,53 @@ class PipelineTests(unittest.TestCase):
                 return json.dumps(data), meta
             return raw, meta
         with patch.object(r, 'call_model', side_effect=bad) as mock:
-            self.assertEqual(self.run_main(), 1)
+            self.assertEqual(self.run_main(), 0)
         self.assertFalse(any(c.args[0].startswith('# USER 信息泄漏') for c in mock.call_args_list))
         self.assertTrue(any(c.args[0].startswith('# USER 自然流畅') for c in mock.call_args_list))
         self.assertIn('案例核验依据失败', r.read_json(self.output / 'summary.json')['skipped'][0]['reason'])
+        index = r.read_json(self.output / 'case_evidence_index.json')
+        saved = r.read_json(Path(index['CASE1']['path']))['result']
+        self.assertEqual(saved['assessment_status'], 'insufficient_evidence')
+        self.assertEqual(saved['facts'], [])
+
+    def test_quote_format_difference_uses_verbatim_source(self):
+        source = {'location': 'text[0]', 'quote': '打开 PST 文件，查看历史邮件'}
+        case = {'case_name': '邮件问题', 'text': ['打开ＰＳＴ文件：查看历史邮件。']}
+        r.validate_source(source, case)
+        self.assertEqual(source, {'location': 'text[0]', 'quote': '打开ＰＳＴ文件：查看历史邮件'})
+
+    def test_partial_case_keeps_valid_fact_and_limits_leakage_conclusion(self):
+        dialogues, cases = r.load_dialogues(self.sim), r.load_cases(self.cases)
+        item = r.make_case_jobs(dialogues, cases, 'mock')[0]
+        data = r.parse_model_json(judge(item['prompt'])[0])
+        bad = copy.deepcopy(data['facts'][0]); bad['fact_id'] = 'F2'
+        bad['source'] = {'location': 'text[0]', 'quote': '并不存在的引文'}
+        data['facts'].append(bad)
+        r.validate_job_result(item, data)
+        self.assertEqual(data['assessment_status'], 'partial')
+        self.assertEqual([f['fact_id'] for f in data['facts']], ['F1'])
+        self.assertEqual(data['excluded_facts'][0]['fact_id'], 'F2')
+        core, _ = r.make_core_jobs(dialogues[:1], cases, 'mock', {'CASE1': data})
+        leakage = next(j for j in core if j['kind'] == 'information_leakage_dialogue')
+        result = {'assessment_status': 'assessed', 'score': 5, 'checks': checks('L'),
+                  'violations': [], 'limitations': []}
+        r.validate_job_result(leakage, result)
+        self.assertEqual(result['assessment_status'], 'partial')
+        self.assertIn('仅部分可用', result['limitations'][0])
+
+    def test_bad_level_or_condition_quote_downgrades_only_that_claim(self):
+        item = r.make_case_jobs(r.load_dialogues(self.sim), r.load_cases(self.cases), 'mock')[0]
+        data = r.parse_model_json(judge(item['prompt'])[0])
+        fact = data['facts'][0]
+        fact['level_evidence'] = {'location': 'text[0]', 'quote': '没有的等级依据'}
+        fact['conditions'] = [{'type': 'acquisition', 'description': '需检查',
+                               'source': {'location': 'text[0]', 'quote': '没有的条件依据'}}]
+        r.validate_job_result(item, data)
+        self.assertEqual(data['assessment_status'], 'partial')
+        self.assertEqual(len(data['facts']), 1)
+        self.assertIsNone(data['facts'][0]['level'])
+        self.assertEqual(data['facts'][0]['conditions'], [])
+        self.assertEqual(len(data['limitations']), 2)
 
     def test_case_quote_wrong_index_recovers_from_saved_raw(self):
         r.write_json(self.cases, [{'case_id': 'CASE1', 'text': ['开头说明。', '唯一的原文引句。']}])
@@ -160,6 +203,9 @@ class PipelineTests(unittest.TestCase):
             source = {'location': 'text[9]', 'quote': quote}
             with self.assertRaisesRegex(ValueError, reason):
                 r.validate_source(source, case)
+        with self.assertRaisesRegex(ValueError, '找不到'):
+            r.validate_source({'location': 'text[0]', 'quote': 'C:/A'},
+                              {'case_name': '标题', 'text': ['CA']})
 
     def test_dry_run_dependencies_without_calls(self):
         with patch.object(r, 'call_model') as mock:
