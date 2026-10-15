@@ -511,8 +511,16 @@ def validate_source(source: Any, case: dict[str, Any]) -> None:
     original = case.get("case_name", "") if location == "case_name" else ""
     if match and int(match[1]) < len(case["text"]):
         original = case["text"][int(match[1])]
-    if source["quote"] not in original:
-        raise ValueError("案例依据引用不属于指定原文位置")
+    if isinstance(original, str) and source["quote"] in original:
+        return
+    locations = [("case_name", case.get("case_name", ""))]
+    locations += [(f"text[{i}]", value) for i, value in enumerate(case["text"])]
+    matches = [place for place, value in locations if isinstance(value, str) and source["quote"] in value]
+    if len(matches) == 1:
+        source["location"] = matches[0]
+        return
+    reason = "案例原文中找不到该引文" if not matches else "引文出现在多个原文位置，无法确定来源"
+    raise ValueError(f"案例依据引用位置 {location!r} 无效：{reason}")
 
 
 def validate_checks(kind: str, data: dict[str, Any]) -> None:
@@ -819,12 +827,22 @@ def validate_job_result(item: dict[str, Any], data: dict[str, Any]) -> None:
     if item["kind"] == "case_information_evidence":
         if data["case_id"] != item["label"]:
             raise ValueError("案例依据 case_id 与输入不一致")
+        corrections = []
         for fact in data["facts"]:
-            validate_source(fact.get("source"), item["_case_source"])
+            sources = [("source", fact.get("source"))]
             if fact["level"] is not None:
-                validate_source(fact.get("level_evidence"), item["_case_source"])
-            for condition in fact["conditions"]:
-                validate_source(condition.get("source"), item["_case_source"])
+                sources.append(("level_evidence", fact.get("level_evidence")))
+            sources += [(f"conditions[{i}].source", condition.get("source")) for i, condition in enumerate(fact["conditions"])]
+            for field, source in sources:
+                previous = source.get("location") if isinstance(source, dict) else None
+                try:
+                    validate_source(source, item["_case_source"])
+                except ValueError as exc:
+                    raise ValueError(f"案例事实 {fact['fact_id']}.{field}：{exc}") from exc
+                if source["location"] != previous:
+                    corrections.append({"fact_id": fact["fact_id"], "field": field, "from": previous, "to": source["location"]})
+        if corrections:
+            data["source_location_corrections"] = corrections
     if item["kind"] == "information_leakage_dialogue":
         facts = {f["fact_id"]: f for f in item["_case_evidence"]["facts"]}
         for event in data["violations"]:

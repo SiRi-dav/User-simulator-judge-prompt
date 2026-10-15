@@ -134,6 +134,33 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(any(c.args[0].startswith('# USER 自然流畅') for c in mock.call_args_list))
         self.assertIn('案例核验依据失败', r.read_json(self.output / 'summary.json')['skipped'][0]['reason'])
 
+    def test_case_quote_wrong_index_recovers_from_saved_raw(self):
+        r.write_json(self.cases, [{'case_id': 'CASE1', 'text': ['开头说明。', '唯一的原文引句。']}])
+        item = r.make_case_jobs(r.load_dialogues(self.sim), r.load_cases(self.cases), 'mock')[0]
+        data = r.parse_model_json(judge(item['prompt'])[0])
+        fact = data['facts'][0]
+        fact['source'] = {'location': 'text[0]', 'quote': '唯一的原文引句。'}
+        fact['level_evidence'] = {'location': 'text[0]', 'quote': '唯一的原文引句。'}
+        dest = self.out / 'results' / (item['job_id'] + '.json')
+        r.write_json(dest, {**{k: item[k] for k in ('job_id', 'kind', 'label', 'model', 'prompt_sha256')},
+                            'status': 'failed', 'raw_response': '<think>完成</think>\n' + json.dumps(data, ensure_ascii=False),
+                            'api': {'finish_reason': 'stop'},
+                            'service_sha256': r.digest(r.api_endpoint('http://mock.invalid/v1'))})
+        with patch.object(r, 'call_model') as mock, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(r.execute_jobs([item], self.out, 'http://mock.invalid/v1', '', 1, 0, False), (1, 0))
+            mock.assert_not_called()
+        result = r.read_json(dest)['result']
+        self.assertEqual(result['facts'][0]['source']['location'], 'text[1]')
+        self.assertEqual(result['facts'][0]['level_evidence']['location'], 'text[1]')
+        self.assertEqual(len(result['source_location_corrections']), 2)
+
+    def test_case_quote_missing_or_ambiguous_remains_failure(self):
+        case = {'case_name': '标题', 'text': ['相同引句。', '相同引句。']}
+        for quote, reason in [('没有的引句', '找不到'), ('相同引句。', '多个原文位置')]:
+            source = {'location': 'text[9]', 'quote': quote}
+            with self.assertRaisesRegex(ValueError, reason):
+                r.validate_source(source, case)
+
     def test_dry_run_dependencies_without_calls(self):
         with patch.object(r, 'call_model') as mock:
             self.assertEqual(self.run_main(self.args + ['--dry-run']), 0)
