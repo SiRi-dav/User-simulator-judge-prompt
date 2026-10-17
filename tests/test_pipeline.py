@@ -269,6 +269,29 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(manifest['pending_leakage'], ['CASE1#1'])
         self.assertFalse(any(j['kind'] == 'information_leakage_dialogue' for j in manifest['jobs']))
 
+    def test_repeated_opening_audit_reaches_batch_prompt(self):
+        first = '我这边有个问题想麻烦看一下'
+        dialogues = [r.make_dialogue({'case_id': cid, 'session_index': 1, 'messages': [
+            {'role': 'user', 'content': opening},
+            {'role': 'assistant', 'content': '请说明问题。'}]}, self.sim)
+            for cid, opening in [('CASE1', first + '，邮箱满了。'),
+                                 ('CASE2', first + '，电脑卡。'),
+                                 ('CASE3', '你好，我想咨询邮箱。')]]
+        audit = r.audit_repeated_openings(dialogues)
+        self.assertEqual(audit['dialogue_count'], 3)
+        self.assertEqual(audit['repeated_openings'][0]['phrase'], first)
+        self.assertEqual(audit['repeated_openings'][0]['count'], 2)
+        self.assertEqual(audit['repeated_openings'][0]['distinct_case_count'], 2)
+        batch = r.make_batch_jobs(dialogues, [], 'mock', 3, {}, '未提供', '未知')[0]
+        self.assertIn('opening_repetition_audit:', batch['prompt'])
+        self.assertIn('"count": 2', batch['prompt'])
+        self.assertNotIn('你好，我想咨询邮箱', json.dumps(audit, ensure_ascii=False))
+        with patch.object(r, 'call_model') as mock:
+            self.assertEqual(self.run_main(self.args + ['--dry-run']), 0)
+            mock.assert_not_called()
+        saved = r.read_json(self.output / 'opening_repetition_audit.json')
+        self.assertEqual(saved['dialogue_count'], 1)
+
     def test_small_scores_and_event_deduction(self):
         data = {'assessment_status': 'partial', 'score': 2, 'checks': checks('L'), 'violations': [
             {'event_id': 'E1', 'category': 'L1', 'severity': 'low', 'deduction': 1},

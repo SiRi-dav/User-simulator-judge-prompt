@@ -1308,6 +1308,25 @@ def compact_annotations(dialogues: list[Dialogue], indexed: dict[str, list[dict[
     ]
 
 
+def audit_repeated_openings(dialogues: list[Dialogue]) -> dict[str, Any]:
+    """Count identical first USER clauses across distinct cases; this is evidence, not a quality verdict."""
+    grouped: dict[str, list[Dialogue]] = defaultdict(list)
+    for dialogue in dialogues:
+        first = next((m["content"].strip() for m in dialogue.messages if m["role"] == "user"), "")
+        clause = re.split(r"[，,。！？!?；;\n]", first, maxsplit=1)[0].strip()
+        clause = unicodedata.normalize("NFKC", clause)
+        if len(clause) >= 10:
+            grouped[clause].append(dialogue)
+    repeated = [
+        {"phrase": phrase, "count": len(matches), "distinct_case_count": len({d.case_id for d in matches}),
+         "dialogue_ids": [d.dialogue_id for d in matches]}
+        for phrase, matches in grouped.items()
+        if len(matches) >= 2 and len({d.case_id for d in matches}) >= 2
+    ]
+    repeated.sort(key=lambda x: (-x["count"], x["phrase"]))
+    return {"dialogue_count": len(dialogues), "method": "第一条 USER 消息首个逗号或句末符号之前的原文；NFKC 归一化；至少 10 字且跨两个案例完全相同", "repeated_openings": repeated}
+
+
 def make_batch_jobs(dialogues: list[Dialogue], real: list[Dialogue], model: str, batch_size: int, stats_by_batch: dict[str, list[dict[str, Any]]], target_population: str, comparison_setup: str, sim_labels: dict[str, list[dict[str, Any]]] | None = None, real_labels: dict[str, list[dict[str, Any]]] | None = None) -> list[dict[str, Any]]:
     jobs = []
     # The displayed real dialogues/labels are a bounded audit sample; the
@@ -1319,7 +1338,8 @@ def make_batch_jobs(dialogues: list[Dialogue], real: list[Dialogue], model: str,
         reference_sample = matched_real[:batch_size]
         real_text = "\n".join(render_dialogue(d, include_outcome=False) for d in reference_sample)
         setup = comparison_setup + ("；展示的真人原文只是同案例参照样例，外部统计使用全部同案例真人对话" if matched_real else "；本批没有同 case_id 真人对话")
-        parts = ["# 评测补充信息", f"- batch_id: {batch_id}", f"- comparison_setup: {setup}", f"- target_population: {target_population}", "", "# 待评价对话", "", "\n".join(render_dialogue(d, include_outcome=False) for d in group)]
+        opening_audit = audit_repeated_openings(group)
+        parts = ["# 评测补充信息", f"- batch_id: {batch_id}", f"- comparison_setup: {setup}", f"- target_population: {target_population}", f"- opening_repetition_audit: {json.dumps(opening_audit, ensure_ascii=False)}", "", "# 待评价对话", "", "\n".join(render_dialogue(d, include_outcome=False) for d in group)]
         if matched_real:
             parts += ["", "# 真实参照对话", "", real_text]
             if sim_labels is not None and real_labels is not None:
@@ -1455,6 +1475,7 @@ def main(argv: list[str] | None = None) -> int:
             # joining annotation records and audit trails.
             raise ValueError("真人与模拟对话存在重复 dialogue_id，请先分别改为唯一编号")
         output.mkdir(parents=True, exist_ok=True)
+        write_json(output / "opening_repetition_audit.json", audit_repeated_openings(dialogues))
         # Aggregates describe this run only. Keep per-job caches for resume.
         for name in ("summary.json", "results.csv", "annotations_simulated.json", "annotations_real.json", "feature_statistics.json", "feature_statistics.csv", "comparison_coverage.json", "case_evidence_index.json"):
             (output / name).unlink(missing_ok=True)
