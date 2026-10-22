@@ -134,7 +134,7 @@ def json_records(path: Path) -> list[Any]:
 
 
 def iter_real_records(path: Path):
-    """Stream large top-level JSON arrays or JSONL without loading every dialogue."""
+    """Stream arrays, JSONL, or an export keyed by numeric conversation IDs."""
     with path.open("r", encoding="utf-8-sig") as file:
         first = file.read(1)
         while first and first.isspace():
@@ -173,29 +173,111 @@ def iter_real_records(path: Path):
                         raise ValueError(f"真人对话 JSON 无法解析：{path}: {exc}") from exc
                     buffer += chunk
                     continue
-                yield record
+                yield from expand_real_record(record)
                 buffer = buffer[end:]
                 expect_value = False
                 seen += 1
+        elif first == "{" and path.suffix.lower() != ".jsonl":
+            # Decode one member at a time: the complete export can contain
+            # hundreds of thousands of conversations. A single-record object
+            # (including the older numeric-key/list layout) is retained intact.
+            decoder = json.JSONDecoder()
+            buffer = ""
+
+            def peek():
+                nonlocal buffer
+                buffer = buffer.lstrip()
+                while not buffer:
+                    chunk = file.read(65536)
+                    if not chunk:
+                        raise ValueError(f"真人对话 JSON 对象未闭合：{path}")
+                    buffer += chunk
+                    buffer = buffer.lstrip()
+                return buffer[0]
+
+            def value():
+                nonlocal buffer
+                peek()
+                while True:
+                    try:
+                        result, end = decoder.raw_decode(buffer)
+                    except json.JSONDecodeError as exc:
+                        chunk = file.read(65536)
+                        if not chunk:
+                            raise ValueError(f"真人对话 JSON 无法解析：{path}: {exc}") from exc
+                        buffer += chunk
+                        continue
+                    if type(result) in {int, float} and end == len(buffer):
+                        chunk = file.read(65536)
+                        if chunk:
+                            buffer += chunk
+                            continue
+                    buffer = buffer[end:]
+                    return result
+
+            direct = {}
+            seen = False
+            while True:
+                if peek() == "}":
+                    buffer = buffer[1:]
+                    if (buffer + file.read()).strip():
+                        raise ValueError(f"真人对话 JSON 对象后有多余内容：{path}")
+                    if direct:
+                        yield from expand_real_record(direct)
+                    return
+                if seen:
+                    if peek() != ",":
+                        raise ValueError(f"真人对话 JSON 对象成员之间缺少逗号：{path}")
+                    buffer = buffer[1:]
+                    if peek() == "}":
+                        raise ValueError(f"真人对话 JSON 对象末尾多余逗号：{path}")
+                key = value()
+                if not isinstance(key, str) or peek() != ":":
+                    raise ValueError(f"真人对话 JSON 对象键无效：{path}")
+                buffer = buffer[1:]
+                body = value()
+                if key.isdigit() and isinstance(body, dict):
+                    yield {**body, "_real_export_id": key}
+                else:
+                    if key in direct:
+                        raise ValueError(f"真人对话 JSON 对象键重复：{key}：{path}")
+                    direct[key] = body
+                seen = True
         elif first:
             if path.suffix.lower() == ".jsonl":
-                yield json.loads(first + file.readline())
+                yield from expand_real_record(json.loads(first + file.readline()))
                 for line in file:
                     if line.strip():
-                        yield json.loads(line)
+                        yield from expand_real_record(json.loads(line))
             else:
-                yield json.loads(first + file.read())
+                yield from expand_real_record(json.loads(first + file.read()))
+
+
+def expand_real_record(obj: Any):
+    """Unwrap numeric-key export members without using their IDs as case IDs."""
+    if isinstance(obj, dict) and obj and all(isinstance(k, str) and k.isdigit() and isinstance(v, dict) for k, v in obj.items()):
+        for key, body in obj.items():
+            yield {**body, "_real_export_id": key}
+    else:
+        yield obj
+
+
+def real_case_values(obj: dict[str, Any]) -> list[str]:
+    fields = [obj[key] for key in ("caseID", "caseId", "case_id") if key in obj]
+    normalized = []
+    for field in fields:
+        values = [field] if isinstance(field, str) else field
+        if not isinstance(values, list) or not values or any(not isinstance(v, str) or not v.strip() for v in values):
+            return []
+        normalized.append(list(dict.fromkeys(v.strip() for v in values)))
+    # Conflicting aliases are ambiguous, never choose one silently.
+    return normalized[0] if normalized and all(v == normalized[0] for v in normalized) else []
 
 
 def real_record_case_id(obj: dict[str, Any]) -> str:
-    if "caseID" in obj:
-        values = obj["caseID"]
-        if isinstance(values, str):
-            values = [values]
-        return values[0].strip() if isinstance(values, list) and len(values) == 1 and isinstance(values[0], str) else ""
-    case_id = obj.get("case_id")
-    if isinstance(case_id, str) and case_id.strip():
-        return case_id.strip()
+    if any(key in obj for key in ("caseID", "caseId", "case_id")):
+        values = real_case_values(obj)
+        return values[0] if len(values) == 1 else ""
     identifier = str(obj.get("dialogue_id") or obj.get("session_id") or "")
     match = ID_RE.match(identifier)
     return match.group(1) if match else ""
@@ -315,26 +397,38 @@ def parse_markdown_dialogues(path: Path) -> list[Dialogue]:
 
 def make_real_dialogue(obj: dict[str, Any], source: Path) -> Dialogue:
     """Read the exported human-service format without treating its numeric key as a case ID."""
-    if "caseID" not in obj:
+    if "messages" in obj:
+        cid = real_record_case_id(obj)
+        normalized = {**obj, "case_id": cid}
+        if obj.get("_real_export_id"):
+            normalized.setdefault("dialogue_id", f"REAL_{obj['_real_export_id']}")
+            normalized.setdefault("session_index", 1)
+        return make_dialogue(normalized, source, source.stem if ID_RE.match(source.stem) else None)
+    if not any(key in obj for key in ("caseID", "caseId", "case_id")):
         return make_dialogue(obj, source, source.stem if ID_RE.match(source.stem) else None)
-    case_ids = obj["caseID"]
-    if isinstance(case_ids, str):
-        case_ids = [case_ids]
-    if not isinstance(case_ids, list) or len(case_ids) != 1 or not isinstance(case_ids[0], str) or not case_ids[0].strip():
-        raise ValueError(f"真人对话 caseID 应恰有一个非空案例编号：{source}")
-    conversation_keys = [key for key, value in obj.items() if isinstance(key, str) and key.isdigit() and isinstance(value, list)]
-    if len(conversation_keys) != 1:
-        raise ValueError(f"真人对话应恰有一个数字对话编号：{source}")
-    conversation_id = conversation_keys[0]
+    case_id = real_record_case_id(obj)
+    if not case_id:
+        raise ValueError(f"真人对话 caseId/caseID/case_id 应恰有一个非空案例编号且字段无冲突：{source}")
+    if isinstance(obj.get("text"), list):
+        conversation_id = str(obj.get("_real_export_id") or obj.get("dialogue_id") or obj.get("session_id") or "")
+        entries = obj["text"]
+    else:
+        conversation_keys = [key for key, value in obj.items() if isinstance(key, str) and key.isdigit() and isinstance(value, list)]
+        if len(conversation_keys) != 1:
+            raise ValueError(f"真人对话应恰有一个数字对话编号：{source}")
+        conversation_id = conversation_keys[0]
+        entries = obj[conversation_id]
+    if not conversation_id:
+        raise ValueError(f"真人对话 text 缺少对话编号：{source}")
     messages = []
-    for index, entry in enumerate(obj[conversation_id], 1):
+    for index, entry in enumerate(entries, 1):
         if not isinstance(entry, dict) or len(entry) != 1:
             raise ValueError(f"真人对话 {conversation_id} 第 {index} 条消息格式不符：{source}")
         role, content = next(iter(entry.items()))
         if role not in {"用户", "客服"} or not isinstance(content, str) or not content.strip():
             raise ValueError(f"真人对话 {conversation_id} 第 {index} 条消息缺少用户/客服文本：{source}")
         messages.append({"role": "user" if role == "用户" else "assistant", "content": content})
-    return make_dialogue({"dialogue_id": f"REAL_{conversation_id}", "case_id": case_ids[0].strip(), "session_index": 1, "messages": messages}, source)
+    return make_dialogue({"dialogue_id": f"REAL_{conversation_id}", "case_id": case_id, "session_index": 1, "messages": messages}, source)
 
 
 def load_dialogues(folder: Path, real_reference: bool = False) -> list[Dialogue]:
@@ -343,7 +437,7 @@ def load_dialogues(folder: Path, real_reference: bool = False) -> list[Dialogue]
         if path.suffix.lower() in {".md", ".txt"}:
             items.extend(parse_markdown_dialogues(path))
         else:
-            for obj in json_records(path):
+            for obj in (iter_real_records(path) if real_reference else json_records(path)):
                 if not isinstance(obj, dict):
                     raise ValueError(f"对话记录不是对象：{path}")
                 items.append(make_real_dialogue(obj, path) if real_reference else make_dialogue(obj, path, path.stem if ID_RE.match(path.stem) else None))
@@ -357,32 +451,44 @@ def load_dialogues(folder: Path, real_reference: bool = False) -> list[Dialogue]
     return items
 
 
-def load_matching_real_dialogues(source: Path, case_ids: set[str]) -> tuple[list[Dialogue], dict[str, int]]:
+def load_matching_real_dialogues(source: Path, case_ids: set[str]) -> tuple[list[Dialogue], dict[str, Any]]:
     """Select exact-case human references before annotation or batch requests."""
     selected = []
-    audit = {"scanned": 0, "missing_case_id": 0, "matched": 0}
+    audit = {"scanned": 0, "missing_case_id": 0, "multiple_case_ids": 0, "unmatched": 0, "matched": 0}
+    formats = Counter()
     for path in list_files(source):
         if path.suffix.lower() in {".md", ".txt"}:
             records = parse_markdown_dialogues(path)
             audit["scanned"] += len(records)
             selected.extend(d for d in records if d.case_id in case_ids)
+            audit["unmatched"] += sum(d.case_id not in case_ids for d in records)
+            formats["markdown"] += len(records)
             continue
         for obj in iter_real_records(path):
             audit["scanned"] += 1
             if not isinstance(obj, dict):
                 raise ValueError(f"真人对话记录不是对象：{path}")
+            formats["keyed_text_export" if "_real_export_id" in obj and "text" in obj else "messages" if "messages" in obj else "legacy_or_other"] += 1
             case_id = real_record_case_id(obj)
             if not case_id:
-                audit["missing_case_id"] += 1
+                audit["multiple_case_ids" if len(real_case_values(obj)) > 1 else "missing_case_id"] += 1
                 continue
             if case_id in case_ids:
                 selected.append(make_real_dialogue(obj, path))
+            else:
+                audit["unmatched"] += 1
     seen = set()
     for dialogue in selected:
         if dialogue.dialogue_id in seen:
             raise ValueError(f"匹配到重复真人对话编号：{dialogue.dialogue_id}")
         seen.add(dialogue.dialogue_id)
     audit["matched"] = len(selected)
+    counts = Counter(d.case_id for d in selected)
+    audit["matched_by_case_id"] = {cid: counts[cid] for cid in sorted(case_ids)}
+    audit["matched_case_count"] = len(counts)
+    audit["unmatched_case_ids"] = sorted(case_ids - counts.keys())
+    audit["formats"] = dict(formats)
+    audit["source"] = str(source.resolve())
     return selected, audit
 
 
@@ -1415,6 +1521,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--workers", type=int, default=3, help="同时执行的模型任务数；默认 3，服务拥堵时设为 1")
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument("--dry-run", action="store_true", help="生成任务清单，不调用模型")
+    parser.add_argument("--check-real-only", action="store_true", help="只检查本批真人参考匹配并保存明细，不调用模型、不清理已有评分结果")
     parser.add_argument("--force", action="store_true", help="忽略成功缓存重新调用；重复性试验应分别使用新的输出目录")
     args = parser.parse_args(argv)
     try:
@@ -1424,7 +1531,6 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"配置错误：{exc}")
     args.model = args.model or config.get("model", "")
     args.base_url = args.base_url or config.get("base_url", "")
-    use_config_real = args.dialogues is None and args.cases is None and args.real_dialogues is None
     use_config_selection = args.dialogues is None and args.cases is None
     args.dialogues = args.dialogues or paths.get("dialogues")
     args.cases = args.cases or paths.get("cases")
@@ -1434,17 +1540,18 @@ def main(argv: list[str] | None = None) -> int:
     args.start_dialogue = args.start_dialogue or 1
     if args.limit_dialogues is None and use_config_selection:
         args.limit_dialogues = paths.get("limit_dialogues")
-    real_from_config = use_config_real and "real_dialogues" in paths
-    if use_config_real:
+    real_from_config = args.real_dialogues is None and "real_dialogues" in paths
+    if args.real_dialogues is None:
         args.real_dialogues = paths.get("real_dialogues")
+    configured_real_source = str(args.real_dialogues) if args.real_dialogues else None
     if not args.dialogues or not args.cases or not args.output:
         parser.error("缺少模拟对话、案例或输出路径；请设置 eval_pipeline/run_config.json 或使用 --dialogues、--cases、--output")
     if real_from_config and (not args.real_dialogues.exists() or not list_files(args.real_dialogues)):
         print(f"真人对话路径尚无可读取文件，本次不执行 B3 真人对比：{args.real_dialogues}", file=sys.stderr)
         args.real_dialogues = None
-    if not args.model:
+    if not args.model and not args.check_real_only:
         parser.error("缺少 --model 或 EVAL_MODEL")
-    if not args.dry_run and not args.base_url:
+    if not args.dry_run and not args.check_real_only and not args.base_url:
         parser.error("缺少 --base-url 或 EVAL_BASE_URL")
     if min(args.batch_size, args.annotation_batch_size, args.min_comparison_n, args.workers) < 1 or args.retries < 0 or args.timeout <= 0:
         parser.error("并发数、批量大小和最小样本数必须为正数，重试次数不能为负")
@@ -1463,11 +1570,13 @@ def main(argv: list[str] | None = None) -> int:
         end_index = start_index + len(dialogues)
         selection = {"total_dialogues": len(all_dialogues), "start_dialogue": args.start_dialogue, "end_dialogue": end_index, "selected_count": len(dialogues), "limit_dialogues": args.limit_dialogues, "dialogue_ids": [d.dialogue_id for d in dialogues]}
         output = output_root / f"dialogues_{args.start_dialogue:05d}-{end_index:05d}" if args.limit_dialogues is not None or args.start_dialogue != 1 else output_root
-        cases = load_cases(args.cases)
         wanted_cases = {d.case_id for d in dialogues}
-        real, real_audit = load_matching_real_dialogues(args.real_dialogues, wanted_cases) if args.real_dialogues else ([], {"scanned": 0, "missing_case_id": 0, "matched": 0})
+        real, real_audit = load_matching_real_dialogues(args.real_dialogues, wanted_cases) if args.real_dialogues else ([], {"scanned": 0, "missing_case_id": 0, "matched": 0, "matched_case_count": 0, "matched_by_case_id": {cid: 0 for cid in sorted(wanted_cases)}, "unmatched_case_ids": sorted(wanted_cases)})
+        real_audit["status"] = "matched" if real else "no_matching_cases" if args.real_dialogues else "source_unavailable" if configured_real_source else "not_configured"
+        real_audit["source"] = configured_real_source
+        real_audit["case_ids"] = sorted(wanted_cases)
         if args.real_dialogues:
-            print(f"真人对话已扫描 {real_audit['scanned']} 条；同 case_id 匹配 {real_audit['matched']} 条；缺少单一 caseID {real_audit['missing_case_id']} 条。", flush=True)
+            print(f"真人对话已扫描 {real_audit['scanned']} 条；同 case_id 匹配 {real_audit['matched']} 条，覆盖 {real_audit['matched_case_count']}/{len(wanted_cases)} 个案例；缺少或冲突案例编号 {real_audit['missing_case_id']} 条，多案例记录 {real_audit['multiple_case_ids']} 条。", flush=True)
         if args.real_dialogues and not real:
             print("真人对话中没有与本批模拟对话相同的 case_id；本次不执行 B3 真人比较。", file=sys.stderr)
         if real and set(d.dialogue_id for d in real) & set(d.dialogue_id for d in dialogues):
@@ -1475,6 +1584,11 @@ def main(argv: list[str] | None = None) -> int:
             # joining annotation records and audit trails.
             raise ValueError("真人与模拟对话存在重复 dialogue_id，请先分别改为唯一编号")
         output.mkdir(parents=True, exist_ok=True)
+        write_json(output / "real_reference_selection.json", real_audit)
+        print(f"真人参考检查：{real_audit['status']}；匹配明细：{output / 'real_reference_selection.json'}", flush=True)
+        if args.check_real_only:
+            return 0 if real else 1
+        cases = load_cases(args.cases)
         write_json(output / "opening_repetition_audit.json", audit_repeated_openings(dialogues))
         # Aggregates describe this run only. Keep per-job caches for resume.
         for name in ("summary.json", "results.csv", "annotations_simulated.json", "annotations_real.json", "feature_statistics.json", "feature_statistics.csv", "comparison_coverage.json", "case_evidence_index.json"):

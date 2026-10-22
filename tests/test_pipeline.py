@@ -85,6 +85,116 @@ class PipelineTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             return r.main(self.args if args is None else args)
 
+    def test_screenshot_export_matches_then_reaches_b3(self):
+        # The numeric outer key is the conversation ID; caseId is inside its
+        # value, after text/Image, exactly as in the company export.
+        r.write_json(self.real, {
+            '22060956': {'text': [{'用户': '网络不通。'}, {'客服': '重连后如何？'}, {'用户': '还是不行。'}],
+                         'Image': [], 'caseId': ['CASE1']},
+            '22061058': {'text': [{'用户': '无关案例不应标注'}], 'caseId': ['OTHER']},
+        })
+        with patch.object(r, 'call_model', side_effect=judge) as mock:
+            self.assertEqual(self.run_main(), 0)
+            count = mock.call_count
+            self.assertEqual(self.run_main(), 0)
+            self.assertEqual(mock.call_count, count)
+        audit = r.read_json(self.output / 'real_reference_selection.json')
+        self.assertEqual(audit['scanned'], 2)
+        self.assertEqual(audit['matched_by_case_id'], {'CASE1': 1})
+        self.assertEqual(audit['unmatched'], 1)
+        self.assertEqual(audit['formats'], {'keyed_text_export': 2})
+        real_labels = r.read_json(self.output / 'annotations_real.json')
+        self.assertEqual(real_labels[0]['dialogue_id'], 'REAL_22060956')
+        manifest = r.read_json(self.output / 'manifest.json')
+        batch = next(j for j in manifest['jobs'] if j['kind'] == 'expression_realism_batch')
+        self.assertTrue(batch['has_real_reference'])
+        self.assertTrue(batch['b3_stat_ids'])
+        result = r.read_json(self.output / 'results' / (batch['job_id'] + '.json'))['result']
+        self.assertEqual(result['B3']['status'], 'compared')
+        prompt = (self.output / 'requests' / (batch['job_id'] + '.txt')).read_text()
+        self.assertIn('REAL_22060956', prompt)
+        self.assertIn('# 表达特征标注', prompt)
+        self.assertIn('# 外部统计', prompt)
+        self.assertNotIn('无关案例不应标注', prompt)
+
+    def test_explicit_sim_paths_keep_real_path_from_config(self):
+        config = self.root / 'paths.json'
+        r.write_json(config, {'real_dialogues': str(self.real)})
+        args = self.args.copy()
+        index = args.index('--real-dialogues')
+        del args[index:index + 2]
+        with patch.object(r, 'call_model') as mock:
+            self.assertEqual(self.run_main(args + ['--run-config', str(config), '--dry-run']), 0)
+            mock.assert_not_called()
+        manifest = r.read_json(self.output / 'manifest.json')
+        self.assertEqual(manifest['real_dialogue_count'], 1)
+        self.assertTrue(any(j['label'].startswith('real_') for j in manifest['jobs'] if j['kind'] == 'expression_feature_annotation'))
+
+    def test_real_export_aliases_formats_and_audit(self):
+        body = {'text': [{'用户': '问题'}, {'客服': '回答'}], 'caseId': ['CASE1']}
+        for suffix, content in (
+            ('.json', {'123': body}),
+            ('.json', [{'123': body}]),
+            ('.jsonl', {'123': body}),
+        ):
+            with self.subTest(suffix=suffix, content=content):
+                path = self.root / ('input' + suffix)
+                path.write_text(json.dumps(content, ensure_ascii=False) + '\n', encoding='utf-8-sig')
+                result, audit = r.load_matching_real_dialogues(path, {'CASE1', 'MISSING'})
+                self.assertEqual([(d.dialogue_id, d.case_id) for d in result], [('REAL_123', 'CASE1')])
+                self.assertEqual(audit['unmatched_case_ids'], ['MISSING'])
+                self.assertEqual(result[0].messages[1]['role'], 'assistant')
+        for alias in ('caseID', 'caseId', 'case_id'):
+            r.write_json(self.real, {'123': {'text': body['text'], alias: ['CASE1']}})
+            self.assertEqual(r.load_matching_real_dialogues(self.real, {'CASE1'})[1]['matched'], 1)
+        r.write_json(self.real, {'123': {**body, 'caseID': ['CONFLICT']},
+                                 '124': {**body, 'caseId': ['CASE1', 'OTHER']},
+                                 '125': {'text': body['text']}})
+        result, audit = r.load_matching_real_dialogues(self.real, {'CASE1'})
+        self.assertEqual(result, [])
+        self.assertEqual(audit['scanned'], 3)
+        self.assertEqual(audit['missing_case_id'], 2)
+        self.assertEqual(audit['multiple_case_ids'], 1)
+
+    def test_keyed_export_streaming_chunks_and_malformed_json(self):
+        body = {'text': [{'用户': '长文本' * 30000}], 'caseId': ['OTHER']}
+        r.write_json(self.real, {'123': body, '124': {**body, 'caseId': ['CASE1']}})
+        # Ensure the keyed export never falls back to whole-file json.loads.
+        with patch.object(r.json, 'loads', side_effect=AssertionError('must stream export')):
+            records, audit = r.load_matching_real_dialogues(self.real, {'CASE1'})
+        self.assertEqual(audit['scanned'], 2)
+        self.assertEqual(records[0].dialogue_id, 'REAL_124')
+        for malformed in ('{"123":', '{"123": {},}', '{"123": {} "124": {}}', '{} trailing', '[{},]'):
+            with self.subTest(malformed=malformed):
+                self.real.write_text(malformed)
+                with self.assertRaises(ValueError):
+                    list(r.iter_real_records(self.real))
+
+    def test_no_match_saved_before_model_calls(self):
+        r.write_json(self.real, {'123': {'text': [{'用户': '无关'}], 'caseId': ['OTHER']}})
+        with patch.object(r, 'call_model') as mock:
+            self.assertEqual(self.run_main(self.args + ['--dry-run']), 0)
+            mock.assert_not_called()
+        audit = r.read_json(self.output / 'real_reference_selection.json')
+        self.assertEqual(audit['status'], 'no_matching_cases')
+        self.assertEqual(audit['matched_by_case_id'], {'CASE1': 0})
+
+    def test_check_real_only_keeps_scores_and_needs_no_model(self):
+        self.output.mkdir(parents=True)
+        existing = self.output / 'summary.json'
+        existing.write_text('{"keep": true}')
+        config = self.root / 'empty_api.json'
+        r.write_json(config, {})
+        args = self.args.copy()
+        for flag in ('--model', '--base-url'):
+            i = args.index(flag)
+            del args[i:i + 2]
+        with patch.dict(r.os.environ, {}, clear=True), patch.object(r, 'call_model') as mock:
+            self.assertEqual(self.run_main(args + ['--api-config', str(config), '--check-real-only']), 0)
+            mock.assert_not_called()
+        self.assertEqual(existing.read_text(), '{"keep": true}')
+        self.assertEqual(r.read_json(self.output / 'real_reference_selection.json')['matched'], 1)
+
     def test_parallel_limit_failure_persistence_and_resume(self):
         # Each pair must reach the model together: serial dispatch cannot pass.
         gate = threading.Barrier(2, timeout=5)
